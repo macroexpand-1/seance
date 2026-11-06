@@ -3,14 +3,13 @@
 ;; Author: Real Limoges <b.real.limoges@gmail.com>
 ;; URL: https://github.com/real-limoges/seance
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1") (sly "1.0.43") (seance "0.1.0"))
 ;; Keywords: lisp, tools, convenience
 ;; SPDX-License-Identifier: BSD-2-Clause
 
 ;;; Commentary:
 ;; TRANSPORT for seance: shoves the snapshot at the `claude' CLI in headless
-;; mode (-p/--print). Runs on whatever subscription the CLI is logged into --
-;; no API key.
+;; mode (-p/--print). Runs on whatever subscription the CLI is logged into, no
+;; API key.
 ;;
 ;; Which is the entire reason this exists next to seance-gptel.el. gptel can
 ;; talk to Claude too, but only if you hand it an API key.
@@ -27,6 +26,8 @@
 
 (require 'sly)
 (require 'seance)
+(require 'json)
+(require 'subr-x)
 
 (defgroup seance-claude nil
   "Push live Lisp image context to Claude via the claude CLI."
@@ -34,9 +35,9 @@
 
 (defcustom seance-claude-program "claude"
   "The Claude Code CLI this shells out to.
-Headless (`-p'), on whatever subscription the CLI is logged into -- no API
-key. Set an absolute path (e.g. \"/opt/homebrew/bin/claude\") when a GUI
-Emacs can't find it on PATH."
+Headless (`-p'), on whatever subscription the CLI is logged into, no API key.
+Set an absolute path (e.g. \"/opt/homebrew/bin/claude\") when a GUI Emacs
+can't find it on PATH."
   :type 'string)
 
 (defcustom seance-claude-model nil
@@ -64,9 +65,9 @@ inherit `seance-profile' instead."
   "When non-nil, run `claude' lean for these one-off calls.
 The process gets a neutral directory and `--setting-sources project', so with
 no project sitting there the SessionStart hooks never fire and no CLAUDE.md
-turns up. Each call carries the image context you sent and nothing else --
-not your whole Claude Code project payload. Cheaper, faster, easier on the
-5-hour limit. Keychain auth survives."
+turns up. Each call carries the image context you sent and nothing else, not
+your whole Claude Code project payload. Cheaper, faster, easier on the 5-hour
+limit. Keychain auth survives."
   :type 'boolean)
 
 (defcustom seance-claude-preamble
@@ -74,11 +75,32 @@ not your whole Claude Code project payload. Cheaper, faster, easier on the
           "REPL via SLY. Definitions evolve in the image; the snapshot below is "
           "the current truth. Prefer small, modular functions. Reply with forms "
           "ready to eval, not file scaffolding.")
-  "System message preamble prepended to image context."
+  "System prompt for a new chat.
+Sent with the first turn only; the CLI keeps it with the session, so turns
+continued with `--resume' still have it."
   :type 'string)
 
 
-;;; TRANSPORT -- the `claude' CLI (your subscription), no gptel / API key
+;;; Framing: what the CLI actually receives. The sends and the preview share
+;;; these, so the preview cannot drift from the real thing.
+
+(defun seance-claude--with-context (ctx msg)
+  "MSG with the snapshot CTX folded in ahead of it."
+  (concat "Current live-image context:\n```\n" ctx "\n```\n\n" msg))
+
+(defun seance-claude--preview (ctx)
+  "What the first turn of a new chat sends, around the snapshot CTX."
+  (concat "## System prompt (first turn; the CLI keeps it for the session)\n\n"
+          seance-claude-preamble "\n\n"
+          "## Message\n\n"
+          (seance-claude--with-context ctx "<your message>")))
+
+(seance-register-transport "claude"
+                           (lambda () (seance--profile seance-claude-profile))
+                           #'seance-claude--preview)
+
+
+;;; TRANSPORT: the `claude' CLI (your subscription), no gptel / API key
 
 ;; (I pick up buffers and put them down)
 
@@ -117,6 +139,23 @@ whatever happened to be current when output landed."
       (save-excursion (goto-char (point-max)) (insert text)))
     (seance-claude--scroll-to-end target)))
 
+(defun seance-claude--parse-json (line)
+  "LINE parsed as a JSON object, a hash table keyed by strings; nil if it isn't.
+Uses the native parser when this Emacs has one. Before Emacs 30 that depends on
+how Emacs was built, and calling it blind on a build without one fails on every
+line, which reads as an empty answer with no error. json.el is the fallback."
+  (condition-case nil
+      (if (and (fboundp 'json-available-p) (json-available-p))
+          (json-parse-string line :object-type 'hash-table
+                             :null-object nil :false-object nil)
+        (let ((json-object-type 'hash-table)
+              (json-key-type 'string)
+              (json-array-type 'list)
+              (json-null nil)
+              (json-false nil))
+          (json-read-from-string line)))
+    (json-error nil)))
+
 (defun seance-claude--handle-event (proc obj target)
   "Act on one parsed stream-json OBJ: text deltas go into TARGET.
 PROC carries `seance-claude-got-text' so that a `result' arriving with no
@@ -142,7 +181,7 @@ deltas before it can still cough up the whole answer."
   "How many non-JSON output lines to keep around as failure diagnostics.")
 
 (defun seance-claude--consume-line (proc line target)
-  "Parse one stdout LINE of stream-json and do something with it.
+  "Parse one stdout LINE of PROC's stream-json; text goes into TARGET.
 Cheap prefix test first, so the enormous SessionStart/hook events get skipped
 without paying for a JSON parse.
 
@@ -152,9 +191,7 @@ nil folds standard error into this same stream, and those lines are the only
 explanation we ever get when the CLI fails."
   (if (or (string-prefix-p "{\"type\":\"stream_event\"" line)
           (string-prefix-p "{\"type\":\"result\"" line))
-      (let ((obj (ignore-errors
-                   (json-parse-string line :object-type 'hash-table
-                                      :null-object nil :false-object nil))))
+      (let ((obj (seance-claude--parse-json line)))
         (when obj (seance-claude--handle-event proc obj target)))
     (let ((trimmed (string-trim line)))
       (unless (or (string-empty-p trimmed) (string-prefix-p "{" trimmed))
@@ -173,13 +210,18 @@ says so and skips the diagnostics."
       (concat (format "\n;; claude exited %d\n" (process-exit-status proc))
               (mapconcat (lambda (line) (format ";; %s\n" line)) diag "")))))
 
+(defun seance-claude--stop (proc)
+  "Kill PROC, marking it as stopped on purpose rather than failed."
+  (process-put proc 'seance-claude-interrupted t)
+  (delete-process proc))
+
 (defun seance-claude--spawn (target prompt extra &optional finalize)
   "Run claude with EXTRA args and PROMPT on stdin; stream the answer back.
 TARGET is where it lands. Output is `--output-format stream-json'; we pick the
 text deltas out and insert them live.
 FINALIZE, if you pass one, runs in TARGET on exit with one argument: non-nil
 when the CLI exited cleanly. Callers need that to tell a turn that happened
-from one that did not -- see how `seance-claude-send' gates `--resume'."
+from one that did not: see how `seance-claude-send' gates `--resume'."
   (let* ((default-directory (if seance-claude-lean
                                 (file-name-as-directory temporary-file-directory)
                               default-directory))
@@ -246,6 +288,7 @@ which cannot tell our prompt from the same line inside an answer Claude wrote.")
     (define-key m (kbd "C-c C-c") #'seance-claude-send)
     (define-key m (kbd "C-c C-r") #'seance-claude)
     (define-key m (kbd "C-c C-k") #'seance-claude-interrupt)
+    (define-key m (kbd "C-c C-e") #'seance-eval-block)
     m)
   "Keymap for `seance-claude-chat-mode'.")
 
@@ -253,7 +296,8 @@ which cannot tell our prompt from the same line inside an answer Claude wrote.")
   "Minor mode for a CLI-backed seance chat buffer.
 \\<seance-claude-chat-mode-map>Type after the `## You' prompt and hit
 \\[seance-claude-send] to send; \\[seance-claude] refreshes the snapshot and
-\\[seance-claude-interrupt] stops an answer in progress."
+\\[seance-claude-interrupt] stops an answer in progress. \\[seance-eval-block]
+evaluates the code block at point in the image."
   :lighter " Seance")
 
 (defun seance-claude--uuid ()
@@ -263,6 +307,22 @@ which cannot tell our prompt from the same line inside an answer Claude wrote.")
           (+ 8 (random 4)) (random 4096)
           (random 65536) (random 65536) (random 65536)))
 
+(defun seance-claude--finish-turn (ok)
+  "Wrap up a turn in this chat buffer; OK is non-nil when the CLI exited cleanly.
+A clean exit is the only proof the CLI created the session, so only that flips
+the chat over to `--resume'. A first turn that failed may still have claimed
+its session id (an interrupted one always does), and the CLI refuses a claimed
+id with \"already in use\" forever after. So a failed first turn gets a fresh
+id for the next try, which is correct whether or not the old one was claimed."
+  (cond (ok (setq seance-claude--started t))
+        ((not seance-claude--started)
+         (setq seance-claude--session (seance-claude--uuid))))
+  (setq seance-claude--proc nil)
+  (goto-char (point-max))
+  (insert "\n\n## You\n\n")
+  (setq seance-claude--input-start (point-marker))
+  (seance-claude--scroll-to-end (current-buffer)))
+
 (defun seance-claude-send ()
   "Send the text after the last `## You' prompt as the next turn in this chat."
   (interactive)
@@ -270,6 +330,8 @@ which cannot tell our prompt from the same line inside an answer Claude wrote.")
     (user-error "Seance-claude: not a chat buffer (use M-x seance-claude)"))
   (when (process-live-p seance-claude--proc)
     (user-error "Seance-claude: still working on the last one (C-c C-k to stop it)"))
+  (when (seance-fetching-p)
+    (user-error "Seance-claude: still gathering the snapshot (C-c C-k to give up)"))
   (let* ((start (or (and (markerp seance-claude--input-start)
                          (marker-position seance-claude--input-start))
                     (point-min)))
@@ -282,48 +344,42 @@ which cannot tell our prompt from the same line inside an answer Claude wrote.")
                              "--system-prompt" seance-claude-preamble)))
            (buf      (current-buffer))
            ;; spawn once we have the final prompt. The image fetch is async, so
-           ;; this may run a beat after the keystroke -- with Emacs live the
-           ;; whole time instead of frozen behind a synchronous `sly-eval'.
+           ;; this may run a beat after the keystroke, with Emacs live the whole
+           ;; time instead of frozen behind a synchronous `sly-eval'.
            (go (lambda (full)
                  (when (buffer-live-p buf)
                    (with-current-buffer buf
+                     (setq seance-claude--refresh nil)
                      (goto-char (point-max))
                      (insert "\n\n## Claude\n\n")
                      (setq seance-claude--proc
-                           (seance-claude--spawn
-                            buf full extra
-                            (lambda (ok)
-                              ;; a clean exit is the only proof the CLI created
-                              ;; the session, so a first turn that died leaves
-                              ;; the next send still asking for --session-id.
-                              (when ok (setq seance-claude--started t))
-                              (setq seance-claude--proc nil)
-                              (goto-char (point-max))
-                              (insert "\n\n## You\n\n")
-                              (setq seance-claude--input-start (point-marker))
-                              (seance-claude--scroll-to-end buf)))))))))
-      (setq seance-claude--refresh nil)
+                           (seance-claude--spawn buf full extra
+                                                 #'seance-claude--finish-turn)))))))
       (if want-ctx
-          (progn
-            (message "seance-claude: gathering the live-image snapshot...")
-            ;; we're in the chat buffer, so focus comes from whatever CAPTURE
-            ;; stashed back in the Lisp buffer. see `seance--focus'
-            (seance-context-string-async
-             (lambda (ctx)
-               (funcall go (concat "Current live-image context:\n```\n"
-                                   ctx "\n```\n\n" msg)))
-             (seance--profile seance-claude-profile)))
+          ;; we're in the chat buffer, so focus comes from whatever CAPTURE
+          ;; stashed back in the Lisp buffer. see `seance--focus'
+          (seance-fetch-context
+           (lambda (ctx) (funcall go (seance-claude--with-context ctx msg)))
+           (seance--profile seance-claude-profile))
         (funcall go msg)))))
 
 ;;;###autoload
 (defun seance-claude-interrupt ()
-  "Stop the `claude' process currently answering in this buffer."
+  "Stop whatever this chat is in the middle of: the snapshot fetch, or the answer."
   (interactive)
-  (unless (process-live-p seance-claude--proc)
-    (user-error "Seance-claude: nothing in flight"))
-  (process-put seance-claude--proc 'seance-claude-interrupted t)
-  (delete-process seance-claude--proc)
-  (message "seance-claude: stopped"))
+  (cond ((seance-fetching-p)
+         (seance-cancel-fetch))
+        ((process-live-p seance-claude--proc)
+         (seance-claude--stop seance-claude--proc)
+         (message "seance-claude: stopped"))
+        (t (user-error "Seance-claude: nothing in flight"))))
+
+(defun seance-claude--stop-on-kill ()
+  "Stop this chat's answer when the chat buffer goes away.
+Nothing else ties the process to the buffer, and left alone it runs to
+completion against your usage limit with nowhere to put the answer."
+  (when (process-live-p seance-claude--proc)
+    (seance-claude--stop seance-claude--proc)))
 
 ;;;###autoload
 (defun seance-claude (&optional new)
@@ -350,12 +406,15 @@ happens to hold the default name."
             (message "Seance-claude: a fresh image snapshot will ride along with your next send"))
         (when (fboundp 'markdown-mode) (markdown-mode))
         (seance-claude-chat-mode 1)
-        (setq seance-claude--session (seance-claude--uuid)
+        (setq seance--chat-transport "claude"
+              seance-claude--session (seance-claude--uuid)
               seance-claude--started nil
               seance-claude--refresh nil)
+        (add-hook 'kill-buffer-hook #'seance-claude--stop-on-kill nil t)
         (insert "# seance-claude chat\n\n"
                 "Type below, then `C-c C-c' to send. `C-c C-r' refreshes the "
-                "image snapshot, `C-c C-k' stops an answer in progress. "
+                "image snapshot, `C-c C-k' stops an answer in progress, "
+                "`C-c C-e' evaluates the code block at point. "
                 "Runs on your Claude Code subscription.\n\n"
                 "## You\n\n")
         (setq seance-claude--input-start (point-marker))))

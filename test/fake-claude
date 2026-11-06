@@ -1,0 +1,49 @@
+#!/bin/sh
+# A stand-in for the claude CLI, for test/seance-claude-test.el.
+#
+# Prints canned stream-json in the shape `claude -p --output-format
+# stream-json` does, so the transport's parsing can be tested without a login
+# or a token. SEANCE_FAKE_CLAUDE picks the run:
+#
+#   streamed     a hook event to skip, text deltas (one split across two
+#                writes), a stray line on stderr, then a clean result
+#   result-only  no deltas, only a result carrying the whole answer
+#   is-error     a result flagged is_error
+#   exit-1       an error on stderr and a nonzero exit, as a reused
+#                --session-id gets
+#
+# Arguments are ignored; the prompt on stdin is read and dropped.
+
+cat > /dev/null
+
+delta() {
+  printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}}\n' "$1"
+}
+
+case "$SEANCE_FAKE_CLAUDE" in
+  streamed)
+    printf '{"type":"system","subtype":"hook_response","output":"a large payload nobody reads"}\n'
+    delta "Hello, "
+    # half an event, a pause, then the rest: one line, two reads
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_'
+    sleep 0.2
+    printf 'delta","text":"wor"}}}\n'
+    echo "a stray warning on stderr" >&2
+    delta "ld."
+    printf '{"type":"result","subtype":"success","is_error":false,"result":"Hello, world."}\n'
+    ;;
+  result-only)
+    printf '{"type":"result","subtype":"success","is_error":false,"result":"The whole answer."}\n'
+    ;;
+  is-error)
+    printf '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API Error: overloaded"}\n'
+    ;;
+  exit-1)
+    echo "Error: Session ID 00000000-0000-4000-8000-000000000000 is already in use." >&2
+    exit 1
+    ;;
+  *)
+    echo "fake-claude: set SEANCE_FAKE_CLAUDE" >&2
+    exit 2
+    ;;
+esac

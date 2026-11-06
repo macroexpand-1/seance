@@ -2,9 +2,9 @@
 
 ;;; Commentary:
 ;; CAPTURE (the log ring, truncation, focus stashing) and ASSEMBLE
-;; (`seance-context-string' and how it picks a focus symbol).
+;; (`seance-context-string-async' and how it picks a focus symbol).
 ;;
-;; ASSEMBLE gets tested by stubbing `sly-eval', so no live image needed. The
+;; ASSEMBLE gets tested by stubbing `sly-eval-async', so no live image needed. The
 ;; image side has its own suite over in test/run-tests.lisp.
 ;;
 ;;   emacs -Q --batch -L . -L test -L $SLY_DIR -l test/seance-test.el \
@@ -25,22 +25,11 @@
   `(let ((seance--log nil)
          (seance--pending nil)
          (seance--last-focus nil)
+         (seance--compiler-notes nil)
          (seance-log-size 12)
          (seance-form-limit 300)
          (seance-profile :lean))
      ,@body))
-
-(defmacro seance-test--capturing-rpc (var &rest body)
-  "Run BODY with `sly-eval' stubbed to record its form into VAR.
-The stub returns a marker string so callers can see it reached the image."
-  (declare (indent 1))
-  ;; the stub's parameter must not be named after anything a caller might pass
-  ;; as VAR, or the `setq' below writes to the lambda's local instead.
-  (let ((arg (gensym "rpc-form-")))
-    `(let ((,var nil))
-       (cl-letf (((symbol-function 'sly-eval)
-                  (lambda (,arg &rest _) (setq ,var ,arg) "<<IMAGE>>")))
-         ,@body))))
 
 (defmacro seance-test--capturing-async-rpc (var reply &rest body)
   "Run BODY with SLY connected and `sly-eval-async' stubbed.
@@ -108,11 +97,11 @@ assertions execute. Assertions therefore belong inside BODY."
     (seance--note-result "stray")
     (should (null seance--log))))
 
-(ert-deftest seance-note-form-then-result-pairs-them ()
+(ert-deftest seance-note-transcript-then-result-pairs-them ()
   (seance-test--with-clean-state
     (with-temp-buffer
       (lisp-mode)
-      (seance--note-form "(+ 1 1)"))
+      (seance--note-transcript '(slynk:interactive-eval "(+ 1 1)")))
     (seance--note-result "2")
     (let ((e (car seance--log)))
       (should (equal "(+ 1 1)" (plist-get e :form)))
@@ -134,7 +123,7 @@ assertions execute. Assertions therefore belong inside BODY."
       (seance--stash-focus))
     (should (equal "my-defun" (car seance--last-focus)))))
 
-(ert-deftest seance-note-form-stashes-focus ()
+(ert-deftest seance-note-transcript-stashes-focus ()
   ;; capture advice runs while point is still in the Lisp buffer
   (seance-test--with-clean-state
     (with-temp-buffer
@@ -142,7 +131,7 @@ assertions execute. Assertions therefore belong inside BODY."
       (insert "(my-defun 1)")
       (goto-char (point-min))
       (forward-char 2)
-      (seance--note-form "(my-defun 1)"))
+      (seance--note-transcript '(slynk:interactive-eval "(my-defun 1)")))
     (should (equal "my-defun" (car seance--last-focus)))))
 
 ;;; ASSEMBLE: rendering
@@ -168,17 +157,18 @@ assertions execute. Assertions therefore belong inside BODY."
       (should (string-match-p (regexp-quote "(def) (defun f ())") out))
       (should (string-match-p (regexp-quote "(+ 1 1)\n => 2") out)))))
 
-(ert-deftest seance-render-log-shows-question-mark-for-missing-result ()
+(ert-deftest seance-render-log-says-so-for-a-missing-result ()
   (seance-test--with-clean-state
     (seance--record 'eval "(hangs)" nil)
-    (should (string-match-p (regexp-quote "=> ?") (seance--render-log)))))
+    (should (string-match-p (regexp-quote "=> (no value: aborted, or still running)")
+                            (seance--render-log)))))
 
-;;; ASSEMBLE: focus resolution -- the bug that made the merge worth doing.
+;;; ASSEMBLE: focus resolution, the bug that made the merge worth doing.
 ;;;
 ;;; Old sly-claude.el called (sly-symbol-at-point) unconditionally, then
 ;;; assembled context from inside its own chat buffer. So the focus it shipped
-;;; was whatever word your cursor was parked on in your own prose -- "slow", out
-;;; of "why is my defun slow" -- or just nil. These keep it fixed.
+;;; was whatever word your cursor was parked on in your own prose ("slow", out
+;;; of "why is my defun slow"), or just nil. These keep it fixed.
 
 (ert-deftest seance-focus-comes-from-point-inside-a-lisp-buffer ()
   (seance-test--with-clean-state
@@ -209,50 +199,7 @@ assertions execute. Assertions therefore belong inside BODY."
         (should (null (car focus)))
         (should (equal "COMMON-LISP-USER" (cdr focus)))))))
 
-;;; ASSEMBLE: the RPC call itself
-
-(ert-deftest seance-context-string-sends-focus-package-and-profile ()
-  (seance-test--with-clean-state
-    (setq seance--last-focus (cons "my-defun" "MY-PKG"))
-    (seance-test--capturing-rpc form
-      (with-temp-buffer
-        (insert "prose")
-        (seance-context-string :full))
-      (should (eq 'slynk-seance:image-context (nth 0 form)))
-      (should (equal "my-defun" (nth 1 form)))
-      (should (equal "MY-PKG"   (nth 2 form)))
-      (should (eq :full         (nth 3 form))))))
-
-(ert-deftest seance-context-string-defaults-profile-to-seance-profile ()
-  (seance-test--with-clean-state
-    (let ((seance-profile :lean))
-      (seance-test--capturing-rpc form
-        (with-temp-buffer (seance-context-string))
-        (should (eq :lean (nth 3 form)))))))
-
-(ert-deftest seance-context-string-appends-the-eval-log ()
-  (seance-test--with-clean-state
-    (seance--record 'eval "(+ 1 1)" "2")
-    (seance-test--capturing-rpc _form
-      (let ((out (with-temp-buffer (seance-context-string))))
-        (should (string-prefix-p "<<IMAGE>>" out))
-        (should (string-match-p (regexp-quote "RECENT EVALS") out))
-        (should (string-match-p (regexp-quote "(+ 1 1)") out))))))
-
-(ert-deftest seance-context-string-degrades-when-the-rpc-fails ()
-  ;; a missing slynk-seance.lisp must not signal into the caller's chat buffer
-  (seance-test--with-clean-state
-    (cl-letf (((symbol-function 'sly-eval)
-               (lambda (&rest _) (error "package SLYNK-SEANCE does not exist"))))
-      (let ((out (with-temp-buffer (seance-context-string))))
-        (should (string-match-p "IMAGE-CONTEXT failed" out))
-        (should (string-match-p "slynk-seance.lisp" out))))))
-
-;;; ASSEMBLE: the async RPC -- the path every transport actually uses.
-;;;
-;;; `seance-context-string' above is kept for tests and deliberate callers;
-;;; seance-claude.el and seance-gptel.el both go through the async one, so the
-;;; branches worth pinning are down here.
+;;; ASSEMBLE: the async RPC, the path every transport uses.
 
 (ert-deftest seance-async-context-does-not-touch-the-image-when-disconnected ()
   (seance-test--with-clean-state
@@ -367,6 +314,233 @@ assertions execute. Assertions therefore belong inside BODY."
           (seance-context-string-async (lambda (s) (setq got s)))))
       (should (string-match-p "trimmed to 12 chars" got)))))
 
+;;; Trimming a section at a time
+
+(defun seance-test--snapshot ()
+  "A snapshot shaped like a real one, with every section a known size."
+  (concat "=== LISP IMAGE CONTEXT (full) ===\nPackage: P\n"
+          "\n--- FOCUS: FOO ---\n" (make-string 200 ?f) "\n"
+          "\n--- NEIGHBORS (one hop out) ---\n" (make-string 300 ?n) "\n"
+          "\n--- REPL ---\n" (make-string 100 ?r) "\n"
+          "\n--- RECENT EVALS (newest last) ---\n"
+          "(oldest)\n" (make-string 200 ?e) "\n(newest)\n"))
+
+(ert-deftest seance-split-sections-gives-back-the-whole-string ()
+  (let* ((s (seance-test--snapshot))
+         (sections (seance--split-sections s)))
+    (should (equal s (mapconcat #'cdr sections "")))
+    (should (equal '(nil "FOCUS" "NEIGHBORS" "REPL" "RECENT EVALS")
+                   (mapcar #'car sections)))))
+
+(ert-deftest seance-trim-takes-the-neighbors-first ()
+  (let* ((s (seance-test--snapshot))
+         (seance-context-limit (- (length s) 100))
+         (out (seance--trim-context s)))
+    (should (<= (length out) seance-context-limit))
+    (should (string-match-p "--- NEIGHBORS" out))
+    (should (string-match-p "chars trimmed" out))
+    ;; nothing else had to give
+    (should (string-match-p (make-string 200 ?f) out))
+    (should (string-match-p (make-string 100 ?r) out))
+    (should (string-match-p (regexp-quote "(oldest)") out))))
+
+(ert-deftest seance-trim-keeps-every-heading-and-the-newest-evals ()
+  (let* ((s (seance-test--snapshot))
+         (seance-context-limit 450)
+         (out (seance--trim-context s)))
+    (should (<= (length out) seance-context-limit))
+    (dolist (heading '("--- FOCUS: FOO ---" "--- NEIGHBORS" "--- REPL ---"
+                       "--- RECENT EVALS"))
+      (should (string-match-p (regexp-quote heading) out)))
+    ;; the eval log gives up its oldest entries, not its newest
+    (should (string-match-p (regexp-quote "(newest)") out))
+    (should-not (string-match-p (regexp-quote "(oldest)") out))
+    ;; and the focus, last in line, kept some of its definition
+    (should (string-match-p "fff" out))))
+
+(ert-deftest seance-trim-falls-back-to-the-end-when-sections-are-not-enough ()
+  (let* ((seance-context-limit 30)
+         (out (seance--trim-context (seance-test--snapshot))))
+    (should (string-match-p "trimmed to 30 chars" out))))
+
+;;; Compiler notes and file compiles
+
+(defun seance-test--note (severity message file)
+  (list :severity severity :message message
+        :location (list :location (list :file file) '(:position 1) nil)))
+
+(ert-deftest seance-compilation-keeps-the-notes-one-line-each ()
+  (seance-test--with-clean-state
+    (seance--note-compilation
+     nil (list (seance-test--note :warning "undefined function:\n  FROB" "/src/a.lisp")
+               (seance-test--note :style-warning "unused X" "/src/a.lisp"))
+     nil t)
+    (should (equal '("warning: undefined function: FROB (a.lisp)"
+                     "style-warning: unused X (a.lisp)")
+                   seance--compiler-notes))
+    (let ((out (seance--render-compiler-notes)))
+      (should (string-match-p "--- COMPILER NOTES (last compile) ---" out))
+      (should (string-match-p "unused X" out)))))
+
+(ert-deftest seance-compilation-without-notes-clears-the-old-ones ()
+  (seance-test--with-clean-state
+    (setq seance--compiler-notes '("warning: stale"))
+    (seance--note-compilation t nil nil t)
+    (should-not seance--compiler-notes)
+    (should (equal "" (seance--render-compiler-notes)))))
+
+(ert-deftest seance-compilation-caps-the-notes ()
+  (seance-test--with-clean-state
+    (let ((seance-compiler-notes-limit 2))
+      (seance--note-compilation
+       nil (make-list 5 (seance-test--note :warning "w" "/a.lisp")) nil t)
+      (should (= 2 (length seance--compiler-notes))))))
+
+(ert-deftest seance-file-compile-enters-the-log ()
+  (seance-test--with-clean-state
+    (with-temp-buffer
+      (setq buffer-file-name "/src/thing.lisp")
+      (seance--note-compilation t nil (current-buffer) t)
+      (setq buffer-file-name nil))
+    (should (string-match-p (regexp-quote "(file) /src/thing.lisp => compiled and loaded")
+                            (seance--render-log)))))
+
+(ert-deftest seance-defun-compile-stays-out-of-the-file-log ()
+  ;; C-c C-c passes no buffer; its form is logged by the compile advice
+  (seance-test--with-clean-state
+    (seance--note-compilation t nil nil t)
+    (should-not seance--log)))
+
+(ert-deftest seance-install-hooks-compilation-and-connection ()
+  (unwind-protect
+      (progn
+        (seance-install)
+        (should (memq #'seance--note-compilation sly-compilation-finished-hook))
+        (should (memq #'seance--sync-automatic-conditions sly-connected-hook))
+        (seance-uninstall)
+        (should-not (memq #'seance--note-compilation sly-compilation-finished-hook))
+        (should-not (memq #'seance--sync-automatic-conditions sly-connected-hook)))
+    (seance-uninstall)))
+
+;;; Automatic conditions: one request on connect, by name
+
+(ert-deftest seance-automatic-conditions-asks-the-image-by-name ()
+  (dolist (setting '(t nil))
+    (let ((seance-automatic-conditions setting))
+      (seance-test--capturing-async-rpc form nil
+        (seance--sync-automatic-conditions)
+        (let ((printed (prin1-to-string form)))
+          (should (string-match-p "\"AUTOMATIC-CONDITIONS\"" printed))
+          (should-not (string-match-p "slynk-seance:automatic" printed))
+          (should (string-match-p (format "(cl:funcall fn %s)" setting) printed)))))))
+
+;;; An open debugger
+
+(defmacro seance-test--with-sldb (&rest body)
+  "Run BODY with one fake SLDB buffer open, at level 2."
+  (declare (indent 0))
+  `(let ((sldb (generate-new-buffer " *seance-test-sldb*")))
+     (unwind-protect
+         (progn
+           (with-current-buffer sldb
+             (setq major-mode 'sly-db-mode
+                   sly-db-level 2
+                   sly-db-condition '("The value NIL is not a NUMBER" "   [Condition of type TYPE-ERROR]")
+                   sly-db-restarts '(("RETRY" "Retry the request")
+                                     ("ABORT" "Return to the top level")))
+             (insert "Backtrace:\n")
+             (setq sly-db-backtrace-start-marker (point-marker))
+             (dotimes (i 2) (insert (format "  %d: (FRAME-%d)\n" i i)))
+             (insert "  --more--\n"))
+           (cl-letf (((symbol-function 'sly-db-buffers) (lambda (&rest _) (list sldb))))
+             ,@body))
+       (kill-buffer sldb))))
+
+(ert-deftest seance-debugger-is-empty-without-one ()
+  (cl-letf (((symbol-function 'sly-db-buffers) (lambda (&rest _) nil)))
+    (should (equal "" (seance--render-debugger)))))
+
+(ert-deftest seance-debugger-carries-condition-restarts-and-top-frames ()
+  (seance-test--with-sldb
+    (let* ((seance-debugger-frames 3)
+           (out (seance--render-debugger)))
+      (should (string-match-p "--- DEBUGGER (level 2) ---" out))
+      (should (string-match-p "The value NIL is not a NUMBER" out))
+      (should (string-match-p (regexp-quote "\n [Condition of type TYPE-ERROR]") out))
+      (should (string-match-p (regexp-quote "1: [ABORT] Return to the top level") out))
+      (should (string-match-p (regexp-quote "\n  1: (FRAME-1)\n") out))
+      (should-not (string-match-p "--more--" out)))))
+
+(ert-deftest seance-debugger-shows-only-the-top-frames ()
+  (seance-test--with-sldb
+    (let ((seance-debugger-frames 1))
+      (should-not (string-match-p (regexp-quote "(FRAME-1)") (seance--render-debugger))))))
+
+(ert-deftest seance-debugger-left-by-stepping-is-not-open ()
+  (seance-test--with-sldb
+    (with-current-buffer sldb (setq sly-db-level nil))
+    (should (equal "" (seance--render-debugger)))))
+
+(ert-deftest seance-async-context-carries-the-debugger ()
+  (seance-test--with-clean-state
+    (seance-test--with-sldb
+      (let ((got nil))
+        (seance-test--capturing-async-rpc _form "<<IMAGE>>"
+          (with-temp-buffer
+            (seance-context-string-async (lambda (s) (setq got s)))))
+        (should (string-match-p "<<IMAGE>>\n--- DEBUGGER" got))))))
+
+;;; Evaluating a code block from the chat
+
+(defconst seance-test--chat
+  "Try this:\n\n```lisp\n(defun foo () 1)\n(foo)\n```\n\nor that:\n\n```\n(bar)\n```\n")
+
+(ert-deftest seance-fenced-block-is-found-around-point ()
+  (with-temp-buffer
+    (insert seance-test--chat)
+    (should (equal "(defun foo () 1)\n(foo)\n"
+                   (seance--fenced-block-at (progn (goto-char (point-min))
+                                                   (search-forward "(foo)")
+                                                   (point)))))
+    (should (equal "(bar)\n"
+                   (seance--fenced-block-at (progn (search-forward "(bar")
+                                                   (point)))))))
+
+(ert-deftest seance-fenced-block-is-nil-in-prose ()
+  (with-temp-buffer
+    (insert seance-test--chat)
+    (should-not (seance--fenced-block-at (point-min)))
+    (should-not (seance--fenced-block-at
+                 (progn (goto-char (point-min)) (search-forward "or that") (point))))))
+
+(ert-deftest seance-eval-block-evaluates-in-the-focus-package-and-logs ()
+  (seance-test--with-clean-state
+    (setq seance--last-focus (cons "my-defun" "MY-PKG"))
+    (let ((sent nil) (package nil))
+      ;; `sly-eval-with-transcript' goes out through `sly-rex', which is a
+      ;; macro, so catch it one step later, as the event it dispatches
+      (cl-letf (((symbol-function 'sly-dispatch-event)
+                 (lambda (event &rest _)
+                   (setq sent (nth 1 event) package (nth 2 event)))))
+        (with-temp-buffer
+          (setq seance--chat-transport "claude")
+          (insert seance-test--chat)
+          (goto-char (point-min))
+          (search-forward "(foo)")
+          (seance-install)
+          (unwind-protect (seance-eval-block (point))
+            (seance-uninstall))))
+      (should (equal '(slynk:interactive-eval-region "(defun foo () 1)\n(foo)") sent))
+      (should (equal "MY-PKG" package))
+      ;; logged like any other eval, and the focus did not move to the chat
+      (should (equal "(defun foo () 1)\n(foo)" (plist-get (car seance--log) :form)))
+      (should (equal '("my-defun" . "MY-PKG") seance--last-focus)))))
+
+(ert-deftest seance-eval-block-refuses-outside-a-block ()
+  (with-temp-buffer
+    (insert "no code here")
+    (should-error (seance-eval-block (point-min)) :type 'user-error)))
+
 ;;; Profile resolution, shared by both transports
 
 (ert-deftest seance-profile-helper-prefers-the-override ()
@@ -377,15 +551,14 @@ assertions execute. Assertions therefore belong inside BODY."
 
 ;;; Wiring
 
-(ert-deftest seance-slynk-file-points-at-the-shared-contrib ()
-  (should (equal "slynk-seance.lisp" (file-name-nondirectory seance-slynk-file))))
+(ert-deftest seance-contrib-loads-the-shared-image-side ()
+  ;; one contrib, one image load, however many backends are loaded
+  (should (equal '(slynk-seance)
+                 (sly-contrib--slynk-dependencies (sly-contrib--find-contrib 'seance))))
+  (should (file-readable-p (expand-file-name "slynk-seance.lisp" seance--path))))
 
 (ert-deftest seance-defaults-to-the-lean-profile ()
   (should (eq :lean (default-value 'seance-profile))))
-
-(ert-deftest seance-installs-exactly-one-connection-hook ()
-  ;; one hook, one image load, however many backends are loaded
-  (should (= 1 (cl-count #'seance-setup-connection sly-connected-hook))))
 
 (provide 'seance-test)
 ;;; seance-test.el ends here

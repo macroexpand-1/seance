@@ -6,3 +6,9 @@
 /.gptel/
 
 .DS_Store
+
+# docs/ is private: decisions, audits, deliverables, notes, state.yaml, html
+docs/*
+
+# except reference/: external sources and architecture diagrams
+!docs/reference/

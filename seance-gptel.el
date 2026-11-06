@@ -3,13 +3,12 @@
 ;; Author: Real Limoges <b.real.limoges@gmail.com>
 ;; URL: https://github.com/real-limoges/seance
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1") (sly "1.0.43") (seance "0.1.0"))
 ;; Keywords: lisp, tools, convenience
 ;; SPDX-License-Identifier: BSD-2-Clause
 
 ;;; Commentary:
 ;; TRANSPORT for seance: hands the snapshot to gptel, which will talk to any
-;; OpenAI-compatible server -- llama.cpp, Ollama, MLX, whatever. The snapshot
+;; OpenAI-compatible server: llama.cpp, Ollama, MLX, whatever. The snapshot
 ;; gets refreshed into the system message before every single send, because
 ;; the image has probably moved since the last one.
 ;;
@@ -54,7 +53,7 @@
 
 ;; The backend object above cannot go in your init: it is a struct that only
 ;; exists once gptel has built it. These three can, and seance builds the
-;; backend from them on first use -- so picking a server is a thing you do
+;; backend from them on first use, so picking a server is a thing you do
 ;; once, rather than every session.
 
 (defcustom seance-gptel-host nil
@@ -73,7 +72,7 @@ Set this and `seance-gptel-model-name' in your init to skip running
 
 (defcustom seance-gptel-profile nil
   "Snapshot size for this backend, overriding `seance-profile'.
-nil inherits `seance-profile', which is `:lean' -- about right for the small
+nil inherits `seance-profile', which is `:lean': about right for the small
 local models this thing usually points at."
   :type '(choice (const :tag "Inherit seance-profile" nil)
           (const :lean) (const :full)))
@@ -97,7 +96,7 @@ Small models follow tight instructions better than vibes."
 (defun seance-gptel--require ()
   "Require gptel."
   (unless (featurep 'gptel)
-    (user-error "seance-gptel: gptel not available: install and configure")))
+    (user-error "Seance-gptel: gptel not available: install and configure")))
 
 (defun seance-gptel--require-openai ()
   "Like `seance-gptel--require', and make sure `gptel-make-openai' is callable.
@@ -160,34 +159,44 @@ telling the user about."
 gptel renamed it: `gptel--system-message' is now an obsolete alias pointing at
 `gptel-system-prompt'. Picking whichever one is actually bound keeps current
 and older gptel both working, and keeps us off a name that will eventually go
-away -- the alias still works today, so nothing here is urgent, but writing to
+away. The alias still works today, so nothing here is urgent, but writing to
 an obsolete variable is how you find out it was dropped."
   (if (boundp 'gptel-system-prompt) 'gptel-system-prompt 'gptel--system-message))
+
+(defun seance-gptel--system-message (ctx)
+  "The system message gptel sends: the preamble, then the snapshot CTX.
+The preview frames its snapshot with this too, so it shows the real thing."
+  (concat seance-gptel-preamble "\n\n" ctx))
+
+(seance-register-transport "gptel"
+                           (lambda () (seance--profile seance-gptel-profile))
+                           #'seance-gptel--system-message)
 
 ;; Re-snapshot the image before each send. The image moved. It always moves.
 (defun seance-gptel-send ()
   "Refresh the snapshot into the system message, then send.
 Bound to whatever `gptel-send' is bound to inside the chat buffer. The snapshot
-is fetched async -- so a slow or wedged image never freezes Emacs -- and the
-send fires once it lands."
+is fetched async (so a slow or wedged image never freezes Emacs) and the send
+fires once it lands. `seance-cancel-fetch' gives up on one that never does."
   (interactive)
-  (message "seance-gptel: gathering the live-image snapshot...")
   ;; we're in the chat buffer, so focus comes from whatever CAPTURE stashed.
   ;; see `seance--focus'
-  (seance-context-string-async
+  (seance-fetch-context
    (lambda (ctx)
      (set (make-local-variable (seance-gptel--system-variable))
-          (concat seance-gptel-preamble "\n\n" ctx))
+          (seance-gptel--system-message ctx))
      (call-interactively #'gptel-send))
    (seance--profile seance-gptel-profile)))
 
 (defvar seance-gptel-chat-mode-map
   (let ((m (make-sparse-keymap)))
     (define-key m [remap gptel-send] #'seance-gptel-send)
+    (define-key m (kbd "C-c C-e") #'seance-eval-block)
     m)
   "Keymap for `seance-gptel-chat-mode'.
 Remaps `gptel-send' to `seance-gptel-send' so every send grabs a fresh
-snapshot first.")
+snapshot first, and puts `seance-eval-block' on
+\\<seance-gptel-chat-mode-map>\\[seance-eval-block].")
 
 (define-minor-mode seance-gptel-chat-mode
   "Re-snapshot the live Lisp image before every gptel send."
@@ -209,6 +218,7 @@ into the system message on the way out."
       (when backend            (setq-local gptel-backend backend))
       (when seance-gptel-model (setq-local gptel-model seance-gptel-model))
       (setq-local gptel-stream t)       ; local models are slow, stream it
+      (setq seance--chat-transport "gptel")
       (seance-gptel-chat-mode 1)
       (goto-char (point-max)))
     (pop-to-buffer buf)))
