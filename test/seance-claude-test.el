@@ -1,7 +1,7 @@
 ;;; seance-claude-test.el --- ERT tests for the claude CLI transport  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Argument construction and session ids. Nothing here spawns the subprocess --
+;; Argument construction and session ids. Nothing here spawns the subprocess:
 ;; that wants a logged-in `claude' CLI, and it costs tokens.
 
 ;;; Code:

@@ -1,7 +1,7 @@
-;;;; fixture.lisp -- sample definitions for the slynk-seance test suite.
+;;;; fixture.lisp: sample definitions for the slynk-seance test suite.
 ;;;;
 ;;;; COMPILE-FILE'd (not just loaded) by run-tests.lisp, because xref data and
-;;;; code-object callees only exist for compiled definitions -- which is how a
+;;;; code-object callees only exist for compiled definitions, which is how a
 ;;;; user's code gets into the image anyway (C-c C-k).
 
 (defpackage :seance-fixture

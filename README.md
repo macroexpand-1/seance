@@ -33,24 +33,28 @@ or gptel plus something to point it at for the other. The image side leans on
 ```elisp
 ;; packages.el
 (package! seance :recipe (:host github :repo "real-limoges/seance"
-                          :files ("seance*.el" "slynk-seance.lisp")))
+                          :files ("seance*.el" "slynk-seance.lisp" "slynk-seance.asd")))
 ```
 
 ```elisp
 ;; config.el
 (after! sly
+  (add-to-list 'sly-contribs 'seance)
   (when (require 'seance-claude nil t)
     (define-key sly-mode-map (kbd "C-c C-S-y") #'seance-claude))
   (when (require 'seance-gptel nil t)
     (define-key sly-mode-map (kbd "C-c C-S-l") #'seance-gptel)))
 ```
 
-`slynk-seance.lisp` has to sit next to `seance.el`: that's how it gets found. Don't fight it.
+It's a real SLY contrib, so that `add-to-list` is the one line of setup.
+SLY does the rest on every connection: it loads the image side and seance starts capturing.
+`M-x sly-disable-contrib` turns the whole thing off again.
+
+`slynk-seance.lisp` and `slynk-seance.asd` have to sit next to `seance.el`: that's how SLY finds them. Don't fight it.
 Otherwise just clone it and shove the directory on your `load-path`.
 
-Nothing to set up per session. On every SLY connection the core loads the image
-side and starts capturing. If a `slynk-seance.lisp` you've been editing is
-broken, you get a message in the echo area, not a faceful of SLDB. You're welcome.
+If a `slynk-seance.lisp` you've been editing is broken, SLY drops you in SLDB on connect.
+Pick the "Continue without SLY contrib slynk-seance" restart and you're back in business, minus seance.
 
 ## Using it
 
@@ -58,6 +62,9 @@ Point at a symbol, hit the key, a chat buffer opens. In the Claude one, `C-c C-c
 sends, `C-c C-r` folds a fresh snapshot into your next message, and `C-c C-k`
 stops an answer you've already seen enough of. The gptel one sends with whatever
 key gptel already uses, and re-snapshots every time.
+
+If the image is wedged and the snapshot never comes back, the send just waits.
+`C-c C-k` gives up on it in the Claude chat; `M-x seance-cancel-fetch` does it in the gptel one.
 
 `C-u M-x seance-claude` opens a second chat in its own buffer, for when you want
 to keep one thread going and start another. `C-c C-r` from inside a chat always

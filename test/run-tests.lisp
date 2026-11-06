@@ -1,11 +1,11 @@
-;;;; run-tests.lisp -- test suite for slynk-seance.lisp
+;;;; run-tests.lisp: test suite for slynk-seance.lisp
 ;;;;
 ;;;; Dependency-free: no test framework, just SBCL and a slynk to load against.
 ;;;;
 ;;;;   sbcl --script test/run-tests.lisp
 ;;;;
 ;;;; slynk is located, in order:
-;;;;   1. $SEANCE_SLYNK_LOADER -- absolute path to slynk-loader.lisp
+;;;;   1. $SEANCE_SLYNK_LOADER: absolute path to slynk-loader.lisp
 ;;;;   2. Quicklisp, if ~/quicklisp/setup.lisp exists  (ql:quickload :slynk)
 ;;;;   3. a few well-known straight.el / ELPA checkouts
 ;;;;
@@ -92,19 +92,19 @@
   (chk "note-condition is exported"
        (eq :external (nth-value 1 (find-symbol "IMAGE-CONTEXT" :slynk-seance)))))
 
-(section "xref-names -- regression: :NOT-IMPLEMENTED must not blow up MAPCAR"
+(section "xref-names: regression, :NOT-IMPLEMENTED must not blow up MAPCAR"
   ;; slynk-backend:calls-who answers :NOT-IMPLEMENTED on SBCL. Before the fix
-  ;; this reached MAPCAR, signalled, got swallowed, and silently produced an
-  ;; empty callee list -- making the whole one-hop expansion dead code.
+  ;; this reached MAPCAR, signaled, got swallowed, and silently produced an
+  ;; empty callee list, making the whole one-hop expansion dead code.
   (chk= ":not-implemented -> nil" nil (call-sq "XREF-NAMES" :not-implemented))
   (chk= "nil -> nil"              nil (call-sq "XREF-NAMES" nil))
-  (chk= "(name . loc) pairs"      '("FOO") (call-sq "XREF-NAMES" '((foo . :loc))))
-  (chk= "bare names"              '("FOO") (call-sq "XREF-NAMES" '(foo)))
-  (chk= "dedupes"                 '("FOO") (call-sq "XREF-NAMES" '((foo . :a) (foo . :b)))))
+  (chk= "(name . loc) pairs"      '(foo) (call-sq "XREF-NAMES" '((foo . :loc))))
+  (chk= "bare names"              '(foo) (call-sq "XREF-NAMES" '(foo)))
+  (chk= "dedupes"                 '(foo) (call-sq "XREF-NAMES" '((foo . :a) (foo . :b)))))
 
 (section "callers / callees against compiled fixture"
-  ;; names come back unqualified: PRINC-TO-STRING binds *print-escape* to NIL,
-  ;; which suppresses the package prefix.
+  ;; names come back as function names (symbols), not strings; STRING-EQUAL
+  ;; compares a symbol by its name.
   (let ((callers (call-sq "CALLERS" 'seance-fixture:focus))
         (callees (call-sq "CALLEES" 'seance-fixture:focus)))
     (chk "focus is called by CALLER"  (member "CALLER" callers :test #'string-equal))
@@ -139,7 +139,7 @@
   (chk "subseq-safe tolerates n > length"
        (equal '(1 2) (call-sq "SUBSEQ-SAFE" '(1 2) 99))))
 
-(section "symbol-summary -- a sprawling interactive definition gets capped"
+(section "symbol-summary: a sprawling interactive definition gets capped"
   ;; EVAL, not COMPILE-FILE: SBCL only retains the lambda expression for
   ;; interactively defined functions, which is exactly the case the cap exists
   ;; for. Everything you care about at a live REPL you defined interactively,
@@ -155,7 +155,7 @@
          (summary (call-sq "SYMBOL-SUMMARY" sym))
          (cap     (symbol-value (sq *max-definition-chars*))))
     ;; if SBCL ever stops retaining this, the cap goes untested rather than
-    ;; silently broken -- so assert the precondition before the behavior.
+    ;; silently broken, so assert the precondition before the behavior.
     (chk "SBCL retained the lambda expression (else this proves nothing)" lex)
     (chk "uncapped the definition would have been enormous"
          (> (length (prin1-to-string lex)) (* 4 cap)))
@@ -165,7 +165,7 @@
     (chk "the doc line still survives" (contains "doc: Sprawler doc." summary))
     ;; *print-case* :downcase replaced a ~(~S~) that also flattened string
     ;; literals inside the definition. Symbols downcase; strings must not.
-    (chk "symbols are downcased"        (contains "sprawler" summary))
+    (chk "symbols are downcased"        (contains "(declare (ignore x))" summary))
     (chk "string literals keep their case"
          (contains "A Fairly Long String Element" summary))))
 
@@ -201,7 +201,7 @@
         (eval (read-from-string
                "(slynk-seance:with-captured-conditions (+ 1 2))"))))
 
-(section "image-context -- :full vs :lean"
+(section "image-context: :full vs :lean"
   (setf (symbol-value (sq *conditions*)) '())
   (handler-case
       (handler-bind ((error (symbol-function (sq note-condition))))
@@ -238,7 +238,7 @@
     (chk "lean trims condition to first line"     (and (contains "boom line one" lean)
                                                        (not (contains "boom line two" lean))))))
 
-(section "image-context -- degenerate inputs"
+(section "image-context: degenerate inputs"
   (let ((no-focus (image-context nil "SEANCE-FIXTURE" :full))
         (bad      (image-context "nonexistent-symbol-xyz" "SEANCE-FIXTURE" :full))
         (bad-pkg  (image-context "focus" "NO-SUCH-PACKAGE" :full)))

@@ -10,30 +10,34 @@
 ;;; Commentary:
 ;; Everything in seance that doesn't care where the bytes end up. Two stages:
 ;;
-;; 1. CAPTURE   -- a small ring of recent evals / compiles, grabbed with stable
-;;                 `advice-add' on SLY's own entry points (not slynk). Also
-;;                 stashes the focus symbol *while point is still in the Lisp
-;;                 buffer*, so a chat buffer can ask about it later.
+;; 1. CAPTURE:  a small ring of recent evals and compiles, grabbed with stable
+;;              `advice-add' on SLY's own entry points (not slynk). Also
+;;              stashes the focus symbol *while point is still in the Lisp
+;;              buffer*, so a chat buffer can ask about it later.
 ;;
-;; 2. ASSEMBLE  -- `seance-context-string' calls SLYNK-SEANCE:IMAGE-CONTEXT for
-;;                 the in-image stuff and staples the local eval log onto it.
+;; 2. ASSEMBLE: `seance-context-string-async' calls SLYNK-SEANCE:IMAGE-CONTEXT
+;;              for the in-image stuff and staples the local eval log onto it.
 ;;
 ;; TRANSPORT is somebody else's problem. Load one, or both:
 ;;
-;;   seance-claude.el  -- the `claude' CLI, on your Claude Code subscription
-;;   seance-gptel.el   -- gptel, pointed at any OpenAI-compatible server
+;;   seance-claude.el: the `claude' CLI, on your Claude Code subscription
+;;   seance-gptel.el:  gptel, pointed at any OpenAI-compatible server
 ;;
-;; They share the ring, the hook, and the assembler that live here, so loading
-;; both doesn't log every eval twice.
+;; They share the ring and the assembler that live here, so loading both
+;; doesn't log every eval twice.
+;;
+;; seance is a SLY contrib. Turn it on once, in your init:
+;;
+;;   (add-to-list 'sly-contribs 'seance)
+;;
+;; SLY then loads slynk-seance.lisp into every image it connects to and
+;; installs capture, and `sly-disable-contrib' turns the lot off again.
 
 ;;; Code:
 
 (require 'sly)
 (require 'cl-lib)
-
-(defvar seance--dir
-  (file-name-directory (or load-file-name buffer-file-name default-directory))
-  "Where seance.el lives, and therefore slynk-seance.lisp next to it.")
+(require 'seq)
 
 (defgroup seance nil
   "Push live Lisp image context to an LLM."
@@ -43,7 +47,7 @@
   "How much snapshot to ask for: `:lean' or `:full'.
 
 That's a question about the model's context budget, not about how the bytes
-travel, so a backend can override it -- see `seance-claude-profile'.
+travel, so a backend can override it: see `seance-claude-profile'.
 
 `:lean' drops the one-hop callee expansion and the REPL values, and trims the
 caller and condition lists. Small local windows need room to breathe."
@@ -59,8 +63,8 @@ caller and condition lists. Small local windows need room to breathe."
 
 (defcustom seance-context-limit 20000
   "Hard cap in chars on the whole assembled snapshot, or nil for no cap.
-Every other limit here is per item -- `seance-form-limit', and the image side's
-own `*max-callers*' and friends -- and none of them bounds the total, which is
+Every other limit here is per item (`seance-form-limit', and the image side's
+own `*max-callers*' and friends), and none of them bounds the total, which is
 the number that actually has to fit in a model's window.
 
 Trimming takes it off the end, which costs you the tail of the eval log rather
@@ -69,27 +73,20 @@ what you cared about; raise the cap in that case rather than reordering, since
 the model reads the beginning most carefully anyway."
   :type '(choice (const :tag "No cap" nil) integer))
 
-(defcustom seance-autoload t
-  "When non-nil, seance sets itself up on every new SLY connection: loads
-`seance-slynk-file' into the Lisp and installs capture advice. No
-`M-x seance-install' needed."
-  :type 'boolean)
-
-(defcustom seance-slynk-file
-  (expand-file-name "slynk-seance.lisp" seance--dir)
-  "The image side, loaded into the Lisp on connect."
-  :type 'file)
-
 
 ;;; CAPTURE
 ;;; entries are the form: (:kind eval|def :form STRING :result STRING-or-nil)
 
 (defvar seance--log nil "Ring of recent interactions, newest first.")
-(defvar seance--pending nil "Form string awaiting its eval result.")
+
+(defvar seance--pending nil
+  "The logged eval entry whose result is due next, or nil.
+Set when an eval goes out, consumed when its value is displayed.")
+
 (defvar seance--last-focus nil
   "Cons (SYMBOL-STRING . PACKAGE-STRING) from the last capture.
 What we fall back on when context gets assembled somewhere that isn't a Lisp
-buffer -- a chat buffer, say, where `sly-symbol-at-point' would happily hand
+buffer (a chat buffer, say), where `sly-symbol-at-point' would happily hand
 back a word out of your own prose.")
 
 (defun seance--truncate (s)
@@ -98,12 +95,12 @@ back a word out of your own prose.")
     s))
 
 (defun seance--record (kind form &optional result)
-  (push (list :kind kind
-              :form (seance--truncate form)
-              :result (seance--truncate result))
-        seance--log)
-  (when (> (length seance--log) seance-log-size)
-    (setq seance--log (cl-subseq seance--log 0 seance-log-size))))
+  "Log an interaction and return its entry."
+  (let ((entry (list :kind kind
+                     :form (seance--truncate form)
+                     :result (seance--truncate result))))
+    (setq seance--log (seq-take (cons entry seance--log) seance-log-size))
+    entry))
 
 (defun seance--stash-focus ()
   "Grab the symbol and package while point is still on the source."
@@ -119,19 +116,45 @@ back a word out of your own prose.")
   (setq seance--log nil seance--pending nil)
   (message "seance: log cleared"))
 
-;; C-x C-e / C-M-x go through `sly-interactive-eval' and the result comes back
-;; out of `sly-display-eval-result'. Stash the form on the way in, pair it with
-;; the value on the way out. Interactive eval is human-paced and serial so this
-;; holds up fine; a stray result with nothing pending just gets dropped.
+;; C-x C-e, C-M-x and an evaluated region all go out through
+;; `sly-eval-with-transcript', and on success their value comes back through
+;; `sly-display-eval-result'. So the form is logged on the way out and its
+;; value filled in on the way back. An eval that aborts never displays a value,
+;; which leaves its entry open: the log says so rather than dropping the form
+;; that just blew up.
 
-(defun seance--note-form (string &rest _)
-  (seance--stash-focus)
-  (setq seance--pending string))
+(defconst seance--eval-rpcs
+  '(slynk:interactive-eval slynk:interactive-eval-region slynk:re-evaluate-defvar)
+  "The `sly-eval-with-transcript' requests that evaluate your source.
+Each takes the source string as its one argument. The other requests that go
+through the transcript (loading a file, say) are not evals and stay out of the
+log.")
+
+(defun seance--note-transcript (form &rest _)
+  "Log FORM's source with no result yet, and expect its value next."
+  (setq seance--pending
+        (when (and (memq (car-safe form) seance--eval-rpcs)
+                   (stringp (cadr form)))
+          (seance--stash-focus)
+          (seance--record 'eval (cadr form)))))
 
 (defun seance--note-result (value &rest _)
+  "Fill VALUE into the pending eval entry, if there is one."
   (when seance--pending
-    (seance--record 'eval seance--pending value)
-    (setq seance--pending nil)))
+    (let ((pending seance--pending)
+          (result  (seance--truncate value)))
+      (setq seance--log (mapcar (lambda (entry)
+                                  (if (eq entry pending)
+                                      (plist-put (copy-sequence entry) :result result)
+                                    entry))
+                                seance--log)
+            seance--pending nil))))
+
+(defun seance--forget-pending (&rest _)
+  "Stop expecting a value for the pending entry.
+An eval in an SLDB frame displays its value through `sly-display-eval-result'
+too, without a transcript, so that value belongs to no logged form."
+  (setq seance--pending nil))
 
 ;; C-c C-c compiles instead of evaling, and might be acting on a region.
 (defun seance--note-compile (&rest _)
@@ -146,27 +169,28 @@ back a word out of your own prose.")
 
 ;;;###autoload
 (defun seance-install ()
-  "Install capture advice. Runs twice without complaint."
+  "Install capture advice. Runs twice without complaint.
+The contrib does this on load; call it yourself only after `seance-uninstall'."
   (interactive)
-  (advice-add 'sly-interactive-eval    :before #'seance--note-form)
-  (advice-add 'sly-display-eval-result :after  #'seance--note-result)
-  (advice-add 'sly-compile-defun       :before #'seance--note-compile)
-  (message "seance: capture installed"))
+  (advice-add 'sly-eval-with-transcript :before #'seance--note-transcript)
+  (advice-add 'sly-display-eval-result  :after  #'seance--note-result)
+  (advice-add 'sly-db-eval-in-frame     :before #'seance--forget-pending)
+  (advice-add 'sly-compile-defun        :before #'seance--note-compile)
+  (when (called-interactively-p 'interactive)
+    (message "seance: capture installed")))
 
 ;;;###autoload
 (defun seance-uninstall ()
-  "Remove capture advice.
-For this session only, and only until the next SLY connection: `seance-autoload'
-puts capture straight back on connect. Set that to nil if you want it to stay
-off. The message says which of the two you just got."
+  "Remove capture advice, for the rest of this Emacs session.
+To turn seance off as a whole, image side included, use `sly-disable-contrib'
+or take `seance' out of `sly-contribs'."
   (interactive)
-  (advice-remove 'sly-interactive-eval    #'seance--note-form)
-  (advice-remove 'sly-display-eval-result #'seance--note-result)
-  (advice-remove 'sly-compile-defun       #'seance--note-compile)
-  (message "seance: capture uninstalled%s"
-           (if seance-autoload
-               " (the next SLY connection will put it back)"
-             "")))
+  (advice-remove 'sly-eval-with-transcript #'seance--note-transcript)
+  (advice-remove 'sly-display-eval-result  #'seance--note-result)
+  (advice-remove 'sly-db-eval-in-frame     #'seance--forget-pending)
+  (advice-remove 'sly-compile-defun        #'seance--note-compile)
+  (when (called-interactively-p 'interactive)
+    (message "seance: capture uninstalled")))
 
 
 ;;; ASSEMBLE
@@ -174,7 +198,7 @@ off. The message says which of the two you just got."
 (defun seance--profile (&optional override)
   "Profile to ask the image for: OVERRIDE if non-nil, else `seance-profile'.
 Each transport keeps its own profile custom that may be nil meaning \"inherit\"
--- see `seance-claude-profile' and `seance-gptel-profile' -- so they resolve it
+(see `seance-claude-profile' and `seance-gptel-profile'), so they resolve it
 through here rather than each spelling out the same `or'."
   (or override seance-profile))
 
@@ -198,13 +222,14 @@ through here rather than each spelling out the same `or'."
           ('def (format "(def) %s\n" (plist-get e :form)))
           (_    (format "%s\n => %s\n"
                         (plist-get e :form)
-                        (or (plist-get e :result) "?")))))
+                        (or (plist-get e :result)
+                            "(no value: aborted, or still running)")))))
       (reverse seance--log) ""))))
 
 (defun seance--focus ()
   "Cons (FOCUS-STRING . PACKAGE-STRING) for whatever we're asking about.
-In a Lisp buffer, point wins. Anywhere else -- a chat buffer, mostly -- use
-what CAPTURE stashed, because out there `sly-symbol-at-point' will cheerfully
+In a Lisp buffer, point wins. Anywhere else (a chat buffer, mostly), use what
+CAPTURE stashed, because out there `sly-symbol-at-point' will cheerfully
 return whatever word you're parked on. Ask the image about \"slow\" and you
 get what you deserve."
   (if (derived-mode-p 'lisp-mode)
@@ -213,38 +238,18 @@ get what you deserve."
     (cons (car seance--last-focus)
           (or (cdr seance--last-focus) "COMMON-LISP-USER"))))
 
-(defun seance-context-string (&optional profile)
-  "What the image knows, via the slynk RPC, plus our own eval log.
-PROFILE overrides `seance-profile' just for this call.
-
-This blocks: `sly-eval' pumps the SLY loop and freezes all of Emacs until the
-image answers, which -- if the image is mid-computation, in SLDB, or otherwise
-wedged -- is forever. Nothing on a keystroke path should call this; those go
-through `seance-context-string-async'. Kept for tests and callers that already
-know they want to wait."
-  (let* ((profile (seance--profile profile))
-         (focus   (seance--focus))
-         (image   (condition-case err
-                      (sly-eval `(slynk-seance:image-context
-                                  ,(car focus) ,(cdr focus) ,profile))
-                    (error
-                     (format (concat ";; SLYNK-SEANCE:IMAGE-CONTEXT failed: %S\n"
-                                     ";; Is slynk-seance.lisp loaded in the image?\n")
-                             err)))))
-    (seance--trim-context (concat image (seance--render-log)))))
-
 (defun seance--image-context-async (focus profile k)
   "Fetch the in-image snapshot for FOCUS at PROFILE, then call K with the string.
 Async on purpose. `slynk-seance:image-context' runs synchronously in the Lisp,
-and reaching it through `sly-eval' would block all of Emacs until it returned --
+and reaching it through `sly-eval' would block all of Emacs until it returned:
 a hard freeze whenever the image is busy or wedged. `sly-eval-async' keeps the
 editor live; K fires with the image string once the reply lands.
 
 The form resolves the RPC by name at runtime rather than mentioning the
 `slynk-seance' package literally, so an image where the contrib never loaded
 comes back as a plain note instead of a read-time package error. Any error
-inside the RPC is caught in-image and returned as a string, matching the sync
-path's promise of no faceful of SLDB."
+inside the RPC is caught in-image and returned as a string, so nothing lands
+you in SLDB."
   (if (not (sly-connected-p))
       (funcall k ";; not connected to a Lisp image, so no live snapshot.\n")
     (sly-eval-async
@@ -257,15 +262,16 @@ path's promise of no faceful of SLDB."
                      (cl:format nil ";; SLYNK-SEANCE:IMAGE-CONTEXT failed: ~A~%" e)))
                   (cl:format nil (cl:concatenate 'cl:string
                                                  ";; slynk-seance.lisp is not loaded in the image.~%"
-                                                 ";; (it loads on connect; M-x seance-install if you skipped that)~%"))))
+                                                 ";; (add seance to sly-contribs and reconnect)~%"))))
       k)))
 
 (defun seance-context-string-async (k &optional profile)
-  "Like `seance-context-string', but async: eventually call K with the string.
-Resolves the focus and log now, in the current buffer, then fires the image RPC
-without blocking. K runs with the assembled image-plus-log string, back in the
-buffer that was current when this was called -- so a chat buffer's callback
-still edits the chat buffer. PROFILE overrides `seance-profile' for this call."
+  "Assemble the snapshot and eventually call K with it, without blocking.
+The snapshot is what the image knows, via the slynk RPC, plus our own eval log.
+Resolves the focus and log now, in the current buffer, then fires the image RPC.
+K runs with the assembled string back in the buffer that was current when this
+was called, so a chat buffer's callback still edits the chat buffer. PROFILE
+overrides `seance-profile' for this call."
   (let* ((profile (seance--profile profile))
          (focus   (seance--focus))
          (log     (seance--render-log))
@@ -277,52 +283,115 @@ still edits the chat buffer. PROFILE overrides `seance-profile' for this call."
          (with-current-buffer buf
            (funcall k (seance--trim-context (concat image log)))))))))
 
+
+;;; FETCH: one snapshot in flight per chat buffer, and a way to give up on it.
+;;; `sly-eval-async' only calls back when the request succeeds, so an image
+;;; that aborts the request or never answers would otherwise leave a send
+;;; waiting forever, and a second send would queue up behind it.
+
+(defvar-local seance--fetch nil
+  "Token for the snapshot fetch this buffer is waiting on, or nil.")
+
+(defun seance-fetching-p ()
+  "Non-nil while this buffer is waiting on a snapshot."
+  (and seance--fetch t))
+
+(defun seance-fetch-context (k &optional profile)
+  "Fetch a snapshot for this buffer and call K with it, unless cancelled first.
+Refuses while an earlier fetch here is still waiting: that one would turn into
+a second send the moment the image answered. PROFILE is as for
+`seance-context-string-async'."
+  (when seance--fetch
+    (user-error "Seance: still waiting on the image (M-x seance-cancel-fetch to give up)"))
+  (let ((token (list 'fetch)))
+    (setq seance--fetch token)
+    (message "seance: gathering the live-image snapshot...")
+    (seance-context-string-async
+     (lambda (ctx)
+       (when (eq seance--fetch token)
+         (setq seance--fetch nil)
+         (funcall k ctx)))
+     profile)))
+
+;;;###autoload
+(defun seance-cancel-fetch ()
+  "Give up on the snapshot this buffer is waiting for; its send never happens."
+  (interactive)
+  (unless seance--fetch
+    (user-error "Seance: no snapshot fetch in flight here"))
+  (setq seance--fetch nil)
+  (message "seance: gave up on the snapshot"))
+
+
+;;; PREVIEW: what a transport would send, with its own profile and framing.
+
+(defvar seance--transports nil
+  "Loaded transports, as an alist of (NAME . PLIST).
+PLIST holds :profile, a function of no arguments returning the profile the
+transport asks for, and :frame, a function from the snapshot string to the text
+the transport sends with it. See `seance-register-transport'.")
+
+(defun seance-register-transport (name profile-fn frame-fn)
+  "Make transport NAME previewable.
+PROFILE-FN returns the profile NAME asks for; FRAME-FN takes a snapshot and
+returns the text NAME actually sends. A transport frames its sends with the
+same FRAME-FN it registers, so the preview cannot drift from the real thing."
+  (setf (alist-get name seance--transports nil nil #'equal)
+        (list :profile profile-fn :frame frame-fn)))
+
+(defvar-local seance--chat-transport nil
+  "Name of the transport that owns this chat buffer, set by its chat mode.")
+
+(defun seance--preview-transport ()
+  "Transport to preview: this chat's own, the only one loaded, or one you pick.
+Nil when no transport is loaded."
+  (cond (seance--chat-transport)
+        ((null seance--transports) nil)
+        ((null (cdr seance--transports)) (caar seance--transports))
+        (t (completing-read "Preview for: " (mapcar #'car seance--transports) nil t))))
+
 ;;;###autoload
 (defun seance-preview-context (&optional profile)
   "Show exactly what would get sent, without sending it.
-With a prefix argument, ask which PROFILE. Start here when an answer looks
-wrong -- usually the snapshot was wrong first. The snapshot arrives async, so
-the buffer pops up right away and fills in when the image replies."
+Previews for this chat buffer's transport, or for the transport you pick when
+more than one is loaded, at that transport's profile and in its framing.
+With a prefix argument, ask which PROFILE to fetch and show the bare snapshot.
+Start here when an answer looks wrong: usually the snapshot was wrong first.
+The snapshot arrives async, so the buffer pops up right away and fills in when
+the image replies."
   (interactive
    (list (when current-prefix-arg
            (intern (completing-read "Profile: " '(":lean" ":full") nil t)))))
-  (let ((buf (get-buffer-create "*seance-context*")))
+  (let* ((transport (unless profile (seance--preview-transport)))
+         (spec      (cdr (assoc transport seance--transports)))
+         (profile   (or profile
+                        (and spec (funcall (plist-get spec :profile)))))
+         (frame     (or (plist-get spec :frame) #'identity))
+         (buf       (get-buffer-create "*seance-context*")))
     (with-current-buffer buf
       (erase-buffer)
       (insert ";; fetching the live-image snapshot...\n"))
     (display-buffer buf)
     (seance-context-string-async
      (lambda (s)
-       (when (buffer-live-p buf)
-         (with-current-buffer buf
-           (erase-buffer)
-           (insert s)
-           (goto-char (point-min)))))
+       (let ((text (funcall frame s)))
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             (erase-buffer)
+             (insert text)
+             (goto-char (point-min))))))
      profile)))
 
 
-;;; AUTOLOAD -- get seance ready on every SLY connection.
-;;; One hook, one image load, one capture ring, no matter how many backends.
+;;; CONTRIB: SLY loads slynk-seance.lisp into each image and turns capture on.
 
-(defun seance-setup-connection ()
-  "Load the image side and install capture on a fresh SLY connection.
-Gated by `seance-autoload'. The load is wrapped in `cl:handler-case', so a
-broken `slynk-seance.lisp' gets reported instead of raised -- nothing dumps
-you into SLDB the moment you connect."
-  (when (and seance-autoload
-             (sly-connected-p)
-             (file-readable-p seance-slynk-file))
-    (sly-eval-async
-        `(cl:handler-case (cl:progn (cl:load ,seance-slynk-file) t)
-          (cl:error (e) (cl:princ-to-string e)))
-      (lambda (res)
-        (if (eq res t)
-            (progn
-              (seance-install)
-              (message "seance: image contrib loaded; capture installed"))
-          (message "seance: image contrib NOT loaded: %s" res))))))
-
-(add-hook 'sly-connected-hook #'seance-setup-connection)
+(define-sly-contrib seance
+  "Hand an LLM a snapshot of the live Lisp image."
+  (:authors "Real Limoges <b.real.limoges@gmail.com>")
+  (:license "BSD-2-Clause")
+  (:slynk-dependencies slynk-seance)
+  (:on-load (seance-install))
+  (:on-unload (seance-uninstall)))
 
 (provide 'seance)
 ;;; seance.el ends here
