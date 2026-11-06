@@ -1,5 +1,5 @@
 .POSIX:
-.PHONY: test test-lisp test-elisp compile clean
+.PHONY: test test-lisp test-elisp compile lint clean
 
 EMACS ?= emacs
 SBCL  ?= sbcl
@@ -20,6 +20,12 @@ GPTEL_DIR ?= $(firstword $(wildcard \
 	$(HOME)/.emacs.d/straight/repos/gptel))
 
 GPTEL_LOAD = $(if $(GPTEL_DIR),-L "$(GPTEL_DIR)")
+
+# Where package-lint lives, for `make lint' only.
+PACKAGE_LINT_DIR ?= $(firstword $(wildcard \
+	$(HOME)/.config/emacs/.local/straight/repos/package-lint \
+	$(HOME)/.emacs.d/.local/straight/repos/package-lint \
+	$(HOME)/.emacs.d/straight/repos/package-lint))
 
 test: test-lisp test-elisp
 
@@ -52,6 +58,14 @@ compile: guard-sly
 	  -L . -L "$(SLY_DIR)" -L "$(SLY_DIR)/lib" $(GPTEL_LOAD) \
 	  --eval '(setq load-prefer-newer t byte-compile-error-on-warn t)' \
 	  -f batch-byte-compile seance.el seance-claude.el seance-gptel.el
+
+## package-lint and checkdoc; any complaint fails. Fetches the GNU and NonGNU
+## ELPA indexes, because package-lint checks that every dependency installs.
+lint:
+	@test -n "$(PACKAGE_LINT_DIR)" || { \
+	  echo "PACKAGE_LINT_DIR is unset and package-lint was not found. Try: make lint PACKAGE_LINT_DIR=/path/to/package-lint"; \
+	  exit 1; }
+	$(EMACS) -Q --batch -L "$(PACKAGE_LINT_DIR)" -l test/lint.el
 
 guard-sly:
 	@test -n "$(SLY_DIR)" || { \

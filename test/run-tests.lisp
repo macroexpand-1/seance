@@ -36,6 +36,11 @@
 (defun contains (needle haystack)
   (and (search needle haystack) t))
 
+(defun count-matches (needle haystack)
+  (loop for start = (search needle haystack) then (search needle haystack :start2 (1+ start))
+        while start
+        count t))
+
 ;;; locate slynk
 
 (defun slynk-loader-path ()
@@ -231,8 +236,12 @@
     (chk "full does NOT expand two hops"          (not (contains "Leaf doc." full)))
     (chk "lean does not expand one hop"           (not (contains "Callee A doc." lean)))
 
-    (chk "full has REPL values"      (contains "--- LAST REPL VALUES ---" full))
-    (chk "lean omits REPL values"    (not (contains "--- LAST REPL VALUES ---" lean)))
+    (chk "full puts the neighbors in their own section"
+         (contains "--- NEIGHBORS (one hop out) ---" full))
+    (chk "lean has no neighbors section" (not (contains "--- NEIGHBORS" lean)))
+
+    (chk "full has a REPL section"   (contains "--- REPL ---" full))
+    (chk "lean has a REPL section"   (contains "--- REPL ---" lean))
 
     (chk "full keeps multi-line condition text"   (contains "boom line two" full))
     (chk "lean trims condition to first line"     (and (contains "boom line one" lean)
@@ -248,6 +257,75 @@
     (chk "unknown package does not signal"      (contains "=== LISP IMAGE CONTEXT" bad-pkg)))
   (chk "profile defaults to :lean"
        (contains "(lean)" (image-context "focus" "SEANCE-FIXTURE"))))
+
+(section "image-context: the package arrives spelled as IN-PACKAGE spells it"
+  ;; SLY sends the package string straight out of the buffer's IN-PACKAGE
+  ;; form. FIND-PACKAGE only understood the first of these, so the others
+  ;; silently lost the FOCUS section.
+  (dolist (spelling '("SEANCE-FIXTURE" ":seance-fixture" "seance-fixture"
+                      "#:seance-fixture"))
+    (let ((out (image-context "focus" spelling :full)))
+      (chk (format nil "~S finds the focus" spelling) (contains "--- FOCUS: " out))
+      (chk (format nil "~S names the package properly" spelling)
+           (contains "Package: SEANCE-FIXTURE" out)))))
+
+(section "image-context: a callee in another package"
+  (let ((full (image-context "reach" "SEANCE-FIXTURE" :full)))
+    (chk "listed with its package prefix"
+         (contains "calls: SEANCE-FIXTURE-UTIL:HELPER" full))
+    (chk "expanded one hop out as itself"
+         (contains "Helper doc, from another package." full)))
+  (let ((focus (image-context "focus" "SEANCE-FIXTURE" :full)))
+    (chk "a same-package callee prints bare"
+         (and (contains "CALLEE-A" focus)
+              (not (contains "SEANCE-FIXTURE:CALLEE-A" focus))))
+    (chk "the focus definition has no package prefixes"
+         (not (contains "seance-fixture::" focus)))
+    (chk "the focus definition has no DEFUN block wrapper"
+         (not (contains "(block focus" focus)))
+    (chk "the focus name is printed once"
+         (= 1 (count-matches "FOCUS:" focus)))))
+
+(section "image-context: the REPL section"
+  ;; a live request runs inside the listener's bindings; here, bind them.
+  (let ((+ '(seance-fixture:focus 1))
+        (++ '(defun seance-fixture:focus () "stale"))
+        (+++ nil)
+        (* 5)
+        (** 'seance-fixture:focus)
+        (*** "Third"))
+    (let ((full (image-context "focus" "SEANCE-FIXTURE" :full))
+          (lean (image-context "focus" "SEANCE-FIXTURE" :lean)))
+      (chk "full shows the last form read, from the focus package"
+           (contains " + (focus 1)" full))
+      (chk "full shows older forms" (contains " ++ (defun focus" full))
+      (chk "a form never read is left out" (not (contains " +++ " full)))
+      (chk "full shows the last value" (contains " * 5" full))
+      (chk "full shows older values" (contains " *** \"Third\"" full))
+      (chk "lean shows the last form and value"
+           (and (contains " + (focus 1)" lean) (contains " * 5" lean)))
+      (chk "lean leaves the older ones out"
+           (and (not (contains " ++ " lean)) (not (contains " ** " lean)))))))
+
+(section "automatic conditions through *eval-for-emacs-wrappers*"
+  (let ((slynk:*eval-for-emacs-wrappers* '()))
+    (setf (symbol-value (sq *conditions*)) '())
+    (chk "turning it on reports on"   (eq t (call-sq "AUTOMATIC-CONDITIONS" t)))
+    (call-sq "AUTOMATIC-CONDITIONS" t)
+    (chk "turning it on twice installs one wrapper"
+         (= 1 (length slynk:*eval-for-emacs-wrappers*)))
+    (let* ((wrapper (first slynk:*eval-for-emacs-wrappers*))
+           (reached nil)
+           (out (funcall wrapper (lambda () 42))))
+      (chk "a quiet request passes its value through" (eql 42 (funcall out)))
+      (handler-case
+          (funcall (funcall wrapper (lambda () (error "escaped the request"))))
+        (error () (setf reached t)))
+      (chk "the condition still reaches slynk's handlers" reached)
+      (chk "and it landed in the ring"
+           (contains "escaped the request" (first (symbol-value (sq *conditions*))))))
+    (chk "turning it off reports off" (null (call-sq "AUTOMATIC-CONDITIONS" nil)))
+    (chk "turning it off removes the wrapper" (null slynk:*eval-for-emacs-wrappers*))))
 
 ;;; report
 

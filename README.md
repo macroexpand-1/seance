@@ -4,8 +4,9 @@ Come commune with the live image.
 
 When you're twenty redefinitions deep at the REPL, the files on disk are fiction.
 The image is the truth. So stop pasting source into a chat window. Relax, un-wind (the stack)
-and send the image instead: the symbol at point, who calls it and what it calls, the last few
-REPL values, whatever conditions blew up recently, and the evals you just ran.
+and send the image instead: the symbol at point, who calls it and what it calls, what you
+just typed at the REPL and what came back, whatever conditions blew up recently, the
+debugger you're sitting in, the compiler's complaints, and the evals you just ran.
 
 It's a SLY contrib. It talks to Claude, or to whatever local model you've got warm.
 It's half ELisp for integrating and half Common Lisp for working with the image.
@@ -20,7 +21,7 @@ It's half ELisp for integrating and half Common Lisp for working with the image.
 gptel could talk to Claude too, but it wants an API key for the privilege. I'm cheap.
 
 Load one or both. Loading both won't log your evals twice: there's one capture
-ring and one connection hook in the core. So rest easy, multi-model native.
+ring in the core. So rest easy, multi-model native.
 
 ## You'll need
 
@@ -74,6 +75,14 @@ The focus symbol comes from wherever you last evaluated something, not from wher
 your cursor happens to be. So asking a question from the chat buffer still asks
 about the code you were working on, rather than about the word "slow".
 
+Got an answer with code in it? Put point in the code block and hit `C-c C-e` (either chat).
+Every form in the block gets evaluated in the package you were working in, and the eval
+goes in the log like any other, so the next turn sees what the suggestion actually did.
+
+Landed in the debugger? Just ask. While an SLDB buffer is open, the snapshot carries the
+condition, the restarts and the top few frames (`seance-debugger-frames`), and it drops
+them again once you're out.
+
 For the gptel side you have to say where the model lives first:
 `M-x seance-gptel-use-openai-compatible`, which prompts for a name, a host, and
 a model. Prefix it (`C-u`) to save the answers, or skip the prompting entirely
@@ -109,7 +118,21 @@ Your wrists will thank you.
 
 Slynk rebinds `*debugger-hook*` around every request, so a handler installed
 globally is already out of scope by the time your form runs. Being inside the
-form is the only place you can see its conditions, which means wrapping it:
+form is the only place you can see its conditions.
+
+For anything you evaluate from a buffer (`C-x C-e`, `C-c C-c`, `C-c C-k`), seance
+can get in there for you:
+
+```elisp
+(setq seance-automatic-conditions t)
+```
+
+That hangs a wrapper on `slynk:*eval-for-emacs-wrappers*`, which slynk runs around
+every request from Emacs. Conditions still go to SLDB as before; seance just takes
+notes on the way past. It's off by default because it sees SLY's own background
+requests too, so one of those failing shows up as well.
+
+The mREPL doesn't go through that seam, so at the REPL you wrap the form yourself:
 
 ```lisp
 (slynk-seance:with-captured-conditions
@@ -121,10 +144,7 @@ wherever it was going, SLDB included, and a body that doesn't signal returns
 its values untouched. `slynk-seance:note-condition` is still there if you want
 to build your own `handler-bind` around something narrower.
 
-They show up in the next snapshot, newest first.
-
-I'd rather this were automatic. It isn't, and the honest reason is above: there
-is no seam in slynk to hang it on that wouldn't break the next time slynk moves.
+Either way, they show up in the next snapshot, newest first.
 
 ## Knobs
 
@@ -140,7 +160,11 @@ actually touch:
   doesn't drag your whole project's `CLAUDE.md` and hooks along for the ride.
 - `seance-context-limit`: 20000 chars, or nil for no ceiling. Everything else
   here caps one item at a time; this caps the assembled total, which is the
-  number that has to fit in the window. Trims off the end and says where.
+  number that has to fit in the window. Over it, sections give up space one at
+  a time, least useful first (the one-hop neighbors) and the focus definition
+  last. Every section keeps its heading and says how much it lost, and the eval
+  log drops its oldest entries, not its newest.
+- `seance-automatic-conditions`: see [Conditions](#conditions).
 
 On the image side, `slynk-seance:*max-definition-chars*` (600) caps any one
 printed definition. SBCL hands back the entire source of anything you defined at
@@ -155,13 +179,20 @@ make test
 
 The Lisp suite loads the contrib into a real SBCL and checks the snapshot it
 produces. The Emacs suite stubs out `sly-eval` and checks everything up to the
-point where bytes leave the building. Nothing spends a token.
+point where bytes leave the building, and runs the Claude transport against
+`test/fake-claude`, a shell script that prints canned stream-json. Nothing spends a token.
 
 If `make` can't find sly, tell it: `make test SLY_DIR=/path/to/sly`.
 
+`make lint` runs package-lint and checkdoc and fails on anything either one says.
+It needs package-lint (`PACKAGE_LINT_DIR=/path/to/package-lint` if it can't find it) and a network connection, because package-lint checks that the dependencies are installable.
+
 gptel is a soft dependency, so the tests that need it skip when it's absent.
 Point at it to run them: `make test GPTEL_DIR=/path/to/gptel`. CI runs the Emacs
-suite both ways, because both are real installs.
+suite both ways, because both are real installs, on Emacs 28.2, 29.4 and 30.1.
+It tests against pinned commits of sly and gptel, and once a week against their
+heads, so an upstream change shows up as a red scheduled run rather than as a
+mystery failure on a PR.
 
 ## Gotcha!
 

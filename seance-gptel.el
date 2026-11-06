@@ -3,7 +3,6 @@
 ;; Author: Real Limoges <b.real.limoges@gmail.com>
 ;; URL: https://github.com/real-limoges/seance
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1") (sly "1.0.43") (seance "0.1.0"))
 ;; Keywords: lisp, tools, convenience
 ;; SPDX-License-Identifier: BSD-2-Clause
 
@@ -97,7 +96,7 @@ Small models follow tight instructions better than vibes."
 (defun seance-gptel--require ()
   "Require gptel."
   (unless (featurep 'gptel)
-    (user-error "seance-gptel: gptel not available: install and configure")))
+    (user-error "Seance-gptel: gptel not available: install and configure")))
 
 (defun seance-gptel--require-openai ()
   "Like `seance-gptel--require', and make sure `gptel-make-openai' is callable.
@@ -192,10 +191,12 @@ fires once it lands. `seance-cancel-fetch' gives up on one that never does."
 (defvar seance-gptel-chat-mode-map
   (let ((m (make-sparse-keymap)))
     (define-key m [remap gptel-send] #'seance-gptel-send)
+    (define-key m (kbd "C-c C-e") #'seance-eval-block)
     m)
   "Keymap for `seance-gptel-chat-mode'.
 Remaps `gptel-send' to `seance-gptel-send' so every send grabs a fresh
-snapshot first.")
+snapshot first, and puts `seance-eval-block' on
+\\<seance-gptel-chat-mode-map>\\[seance-eval-block].")
 
 (define-minor-mode seance-gptel-chat-mode
   "Re-snapshot the live Lisp image before every gptel send."

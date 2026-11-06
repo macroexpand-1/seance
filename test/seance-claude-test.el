@@ -1,8 +1,9 @@
 ;;; seance-claude-test.el --- ERT tests for the claude CLI transport  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Argument construction and session ids. Nothing here spawns the subprocess:
-;; that wants a logged-in `claude' CLI, and it costs tokens.
+;; Argument construction, session ids, and the stream parser. The real `claude'
+;; CLI never runs: it wants a login and costs tokens. The parser is tested
+;; against test/fake-claude instead, which prints canned stream-json.
 
 ;;; Code:
 
@@ -130,6 +131,71 @@
 (ert-deftest seance-claude-interrupt-refuses-when-nothing-is-running ()
   (with-temp-buffer
     (should-error (seance-claude-interrupt) :type 'user-error)))
+
+;;; The stream parser, end to end against test/fake-claude
+
+(defconst seance-claude-test--fake
+  (expand-file-name "fake-claude"
+                    (file-name-directory (or load-file-name buffer-file-name)))
+  "A stand-in CLI that prints canned stream-json; see the script.")
+
+(defun seance-claude-test--run (scenario)
+  "Run the fake CLI through the real transport for SCENARIO.
+Returns (TEXT . OK): what landed in the target buffer, and what the finalize
+callback was told about the exit."
+  (let ((seance-claude-program seance-claude-test--fake)
+        (process-environment (cons (concat "SEANCE_FAKE_CLAUDE=" scenario)
+                                   process-environment))
+        (target (generate-new-buffer " *seance-claude-test*"))
+        (done nil)
+        (ok nil))
+    (unwind-protect
+        (let ((proc (seance-claude--spawn target "the prompt" nil
+                                          (lambda (exit-ok) (setq done t ok exit-ok)))))
+          (with-timeout (10 (error "Fake claude never finished"))
+            (while (not done)
+              (accept-process-output proc 0.05)))
+          (cons (with-current-buffer target (buffer-string)) ok))
+      (kill-buffer target))))
+
+(ert-deftest seance-claude-stream-puts-the-deltas-together ()
+  (let ((run (seance-claude-test--run "streamed")))
+    ;; the delta split across two writes arrives whole, the hook event and
+    ;; the stderr line stay out, and the result does not repeat the deltas
+    (should (equal "Hello, world." (car run)))
+    (should (cdr run))))
+
+(ert-deftest seance-claude-stream-falls-back-to-the-result ()
+  (let ((run (seance-claude-test--run "result-only")))
+    (should (equal "The whole answer." (car run)))
+    (should (cdr run))))
+
+(ert-deftest seance-claude-stream-says-so-when-claude-reports-an-error ()
+  (let ((run (seance-claude-test--run "is-error")))
+    (should (string-match-p ";; claude error: API Error: overloaded" (car run)))))
+
+(ert-deftest seance-claude-stream-explains-a-failed-exit ()
+  (let ((run (seance-claude-test--run "exit-1")))
+    (should-not (cdr run))
+    (should (string-match-p ";; claude exited 1" (car run)))
+    ;; stderr is the only explanation the CLI gives, so it is kept
+    (should (string-match-p "is already in use" (car run)))))
+
+(ert-deftest seance-claude-stream-stays-quiet-about-a-requested-stop ()
+  (let ((seance-claude-program seance-claude-test--fake)
+        (process-environment (cons "SEANCE_FAKE_CLAUDE=streamed" process-environment))
+        (target (generate-new-buffer " *seance-claude-test*"))
+        (done nil))
+    (unwind-protect
+        (let ((proc (seance-claude--spawn target "the prompt" nil
+                                          (lambda (_ok) (setq done t)))))
+          (seance-claude--stop proc)
+          (with-timeout (10 (error "Fake claude never finished"))
+            (while (not done) (accept-process-output nil 0.05)))
+          (let ((text (with-current-buffer target (buffer-string))))
+            (should (string-match-p ";; stopped." text))
+            (should-not (string-match-p "exited" text))))
+      (kill-buffer target))))
 
 (provide 'seance-claude-test)
 ;;; seance-claude-test.el ends here

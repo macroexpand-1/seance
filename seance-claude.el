@@ -3,7 +3,6 @@
 ;; Author: Real Limoges <b.real.limoges@gmail.com>
 ;; URL: https://github.com/real-limoges/seance
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1") (sly "1.0.43") (seance "0.1.0"))
 ;; Keywords: lisp, tools, convenience
 ;; SPDX-License-Identifier: BSD-2-Clause
 
@@ -182,7 +181,7 @@ deltas before it can still cough up the whole answer."
   "How many non-JSON output lines to keep around as failure diagnostics.")
 
 (defun seance-claude--consume-line (proc line target)
-  "Parse one stdout LINE of stream-json and do something with it.
+  "Parse one stdout LINE of PROC's stream-json; text goes into TARGET.
 Cheap prefix test first, so the enormous SessionStart/hook events get skipped
 without paying for a JSON parse.
 
@@ -289,6 +288,7 @@ which cannot tell our prompt from the same line inside an answer Claude wrote.")
     (define-key m (kbd "C-c C-c") #'seance-claude-send)
     (define-key m (kbd "C-c C-r") #'seance-claude)
     (define-key m (kbd "C-c C-k") #'seance-claude-interrupt)
+    (define-key m (kbd "C-c C-e") #'seance-eval-block)
     m)
   "Keymap for `seance-claude-chat-mode'.")
 
@@ -296,7 +296,8 @@ which cannot tell our prompt from the same line inside an answer Claude wrote.")
   "Minor mode for a CLI-backed seance chat buffer.
 \\<seance-claude-chat-mode-map>Type after the `## You' prompt and hit
 \\[seance-claude-send] to send; \\[seance-claude] refreshes the snapshot and
-\\[seance-claude-interrupt] stops an answer in progress."
+\\[seance-claude-interrupt] stops an answer in progress. \\[seance-eval-block]
+evaluates the code block at point in the image."
   :lighter " Seance")
 
 (defun seance-claude--uuid ()
@@ -412,7 +413,8 @@ happens to hold the default name."
         (add-hook 'kill-buffer-hook #'seance-claude--stop-on-kill nil t)
         (insert "# seance-claude chat\n\n"
                 "Type below, then `C-c C-c' to send. `C-c C-r' refreshes the "
-                "image snapshot, `C-c C-k' stops an answer in progress. "
+                "image snapshot, `C-c C-k' stops an answer in progress, "
+                "`C-c C-e' evaluates the code block at point. "
                 "Runs on your Claude Code subscription.\n\n"
                 "## You\n\n")
         (setq seance-claude--input-start (point-marker))))

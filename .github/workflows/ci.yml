@@ -4,47 +4,113 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Mondays: the same suite against the heads of sly and gptel, so an
+  # upstream change shows up here rather than as a mystery failure on a PR.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# Known-good upstream commits. Pushes and PRs test against these, so a PR only
+# fails for something it changed. The scheduled run ignores them and tests the
+# heads; when that goes red and these do not, upstream moved, and bumping these
+# is the fix once seance copes.
+env:
+  SLY_REF: 3ffa216d0818972f7a7fea38a566a6b570349f3b
+  GPTEL_REF: e161ababf0cb19654ec9097f06c09c95d4561721
+  PACKAGE_LINT_REF: 1865be780a16098f972fef50a52b21ca6ee04df9
 
 jobs:
-  test:
+  emacs:
+    name: Emacs ${{ matrix.emacs }}${{ matrix.gptel && ' + gptel' || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 28.2 is the floor every file declares; this is what holds it to that.
+        emacs: ['28.2', '29.4', '30.1']
+        gptel: [false]
+        # gptel: true overrides a value of the matrix, so this adds a leg
+        # rather than turning the plain 30.1 one into it.
+        include:
+          # gptel itself wants a newer transient and compat than Emacs 28
+          # ships, so the with-gptel leg runs on the newest Emacs only.
+          - emacs: '30.1'
+            gptel: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs }}
+
+      - name: Check out sly
+        uses: actions/checkout@v4
+        with:
+          repository: joaotavora/sly
+          ref: ${{ github.event_name != 'schedule' && env.SLY_REF || '' }}
+          path: .sly
+
+      - name: Check out gptel
+        if: matrix.gptel
+        uses: actions/checkout@v4
+        with:
+          repository: karthink/gptel
+          ref: ${{ github.event_name != 'schedule' && env.GPTEL_REF || '' }}
+          path: .gptel
+
+      # With gptel on the load-path, writing one of its obsolete variable
+      # names is a build failure rather than a surprise years later.
+      - name: Byte-compile (warnings are errors)
+        run: |
+          make compile SLY_DIR="$GITHUB_WORKSPACE/.sly" \
+                       GPTEL_DIR="${{ matrix.gptel && '$GITHUB_WORKSPACE/.gptel' || '' }}"
+
+      - name: Test the Emacs side
+        run: |
+          make test-elisp SLY_DIR="$GITHUB_WORKSPACE/.sly" \
+                          GPTEL_DIR="${{ matrix.gptel && '$GITHUB_WORKSPACE/.gptel' || '' }}"
+
+  # Not for MELPA, which is not a goal: these just catch docstring and header
+  # mistakes the byte-compiler lets through.
+  lint:
+    name: package-lint and checkdoc
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out sly (provides both the elisp and slynk)
+      - uses: purcell/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Check out package-lint
+        uses: actions/checkout@v4
+        with:
+          repository: purcell/package-lint
+          ref: ${{ github.event_name != 'schedule' && env.PACKAGE_LINT_REF || '' }}
+          path: .package-lint
+
+      - name: Lint
+        run: make lint PACKAGE_LINT_DIR="$GITHUB_WORKSPACE/.package-lint"
+
+  image:
+    name: SBCL image side
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out sly (for slynk)
         uses: actions/checkout@v4
         with:
           repository: joaotavora/sly
+          ref: ${{ github.event_name != 'schedule' && env.SLY_REF || '' }}
           path: .sly
 
-      - name: Check out gptel (soft dependency; its tests skip without it)
-        uses: actions/checkout@v4
-        with:
-          repository: karthink/gptel
-          path: .gptel
-
-      - name: Install SBCL and Emacs
+      - name: Install SBCL
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends sbcl emacs-nox
-
-      # gptel on the load-path here is what makes writing one of its obsolete
-      # variable names a build failure rather than a surprise years later.
-      - name: Byte-compile (warnings are errors)
-        run: |
-          make compile SLY_DIR="$GITHUB_WORKSPACE/.sly" \
-                       GPTEL_DIR="$GITHUB_WORKSPACE/.gptel"
+          sudo apt-get install -y --no-install-recommends sbcl
 
       - name: Test the image side
         env:
           SEANCE_SLYNK_LOADER: ${{ github.workspace }}/.sly/slynk/slynk-loader.lisp
         run: make test-lisp
-
-      - name: Test the Emacs side
-        run: |
-          make test-elisp SLY_DIR="$GITHUB_WORKSPACE/.sly" \
-                          GPTEL_DIR="$GITHUB_WORKSPACE/.gptel"
-
-      # and once more without it, since gptel really is optional
-      - name: Test the Emacs side without gptel
-        run: make test-elisp SLY_DIR="$GITHUB_WORKSPACE/.sly" GPTEL_DIR=

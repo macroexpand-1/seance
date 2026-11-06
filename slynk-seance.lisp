@@ -26,6 +26,8 @@
   (:export #:image-context
            #:note-condition
            #:with-captured-conditions
+           #:automatic-conditions
+           #:capture-request-conditions
            #:*max-callers*
            #:*max-conditions*
            #:*max-neighbors*
@@ -53,12 +55,13 @@ defuns crowds everything else out of the snapshot.")
 (defvar *conditions* '()
   "Recent conditions, most recent first.")
 
-;;; Conditions: you feed the ring yourself.
+;;; Conditions: something has to be inside the form's dynamic extent to see them.
 ;;;
 ;;; slynk rebinds *DEBUGGER-HOOK* per request, so a global hook is already out
-;;; of scope by the time your form runs. Wrap the form in
-;;; WITH-CAPTURED-CONDITIONS (below), or put NOTE-CONDITION in a HANDLER-BIND
-;;; of your own around something narrower.
+;;; of scope by the time your form runs. AUTOMATIC-CONDITIONS (further down)
+;;; covers requests from Emacs buffers; at the mREPL, wrap the form in
+;;; WITH-CAPTURED-CONDITIONS, or put NOTE-CONDITION in a HANDLER-BIND of your
+;;; own around something narrower.
 
 (defun subseq-safe (list n)
   (subseq list 0 (min n (length list))))
@@ -270,15 +273,60 @@ one indented line each. The name itself is the caller's to print."
         (let ((doc (documentation symbol 'function)))
           (when doc (format s " doc: ~A~%" (first-line doc))))))))
 
-(defun repl-values ()
+;;; The REPL. A request from Emacs runs inside the default listener's bindings,
+;;; so +, ++, +++ (the last forms the mREPL read) and *, **, *** (the last
+;;; values it returned) are the listener's own, not the globals. They are listed
+;;; apart rather than paired: + moves when a form is read and * only when one
+;;; returns, so after an aborted form + is that form and * is still the value
+;;; of the one before it.
+
+(defun printed-variable (variable printer)
+  "VARIABLE's value through PRINTER, or a note when it has none to print."
+  (handler-case (funcall printer (symbol-value variable))
+    (unbound-variable () "<unbound>")
+    (error () "<unprintable>")))
+
+(defun print-form (form)
+  (let ((*print-case* :downcase))
+    (truncate-print form 300)))
+
+(defun repl-history (n)
+  "The last N forms read at the REPL and the last N values, newest first.
+Forms nobody has read yet (a fresh REPL) are left out rather than shown as NIL."
   (with-output-to-string (s)
-    (loop for var in '(* ** ***)
+    (format s " (an aborted form has no value, so these two lists need not line up)~%")
+    (loop for var in (subseq-safe '(+ ++ +++) n)
+          for label in '("+" "++" "+++")
+          when (and (boundp var) (symbol-value var))
+            do (format s " ~A ~A~%" label (printed-variable var #'print-form)))
+    (loop for var in (subseq-safe '(* ** ***) n)
           for label in '("*" "**" "***")
-          do (format s "~% ~A => ~A"
-                     label
-                     (handler-case (truncate-print (symbol-value var))
-                       (unbound-variable () "<unbound>")
-                       (error () "<unprintable>"))))))
+          do (format s " ~A ~A~%" label (printed-variable var #'truncate-print)))))
+
+;;; Automatic conditions, opt-in. SLYNK:*EVAL-FOR-EMACS-WRAPPERS* runs every
+;;; request from Emacs (C-x C-e, C-c C-c, C-c C-k, and every SLY internal
+;;; request too) inside each wrapper's dynamic extent. One that establishes
+;;; WITH-CAPTURED-CONDITIONS sees whatever escapes the form's own handlers.
+;;; mREPL input arrives over a channel instead, so the REPL still needs the
+;;; macro by hand.
+
+(defun capture-request-conditions (in-function &rest extra-options)
+  "Wrap IN-FUNCTION so that serious conditions escaping it land in the ring.
+Shaped as SLYNK:*EVAL-FOR-EMACS-WRAPPERS* wants: it returns the function to
+call, and that function calls IN-FUNCTION."
+  (declare (ignore extra-options))
+  (lambda ()
+    (with-captured-conditions (funcall in-function))))
+
+(defun automatic-conditions (on)
+  "Note conditions from every request Emacs makes when ON, or stop when not.
+Installs CAPTURE-REQUEST-CONDITIONS innermost, so its handler runs before any
+slynk establishes around the request. Returns whether capture is now on."
+  (setf slynk:*eval-for-emacs-wrappers*
+        (remove 'capture-request-conditions slynk:*eval-for-emacs-wrappers*))
+  (when on
+    (push 'capture-request-conditions slynk:*eval-for-emacs-wrappers*))
+  (and on t))
 
 ;;; RPC
 
@@ -309,13 +357,16 @@ package come out bare and names from anywhere else keep their prefix."
                     (printed-names (subseq-safe callers n-call)))
             (format out " calls: ~{~A~^, ~}~%"
                     (printed-names (subseq-safe callees n-call)))
-            ;; one hop neighborhood - only full
-            (when full
-              (dolist (neighbor (subseq-safe (expandable-neighbors focus callees)
-                                             *max-neighbors*))
-                (format out "~%~S~%~A" neighbor (symbol-summary neighbor))))))
-        (when full
-          (format out "~%--- LAST REPL VALUES ---~A~%" (repl-values))))
+            ;; one hop neighborhood, only under :full. Its own section, so a
+            ;; snapshot over Emacs's size limit can give it up first.
+            (let ((neighbors (and full
+                                  (subseq-safe (expandable-neighbors focus callees)
+                                               *max-neighbors*))))
+              (when neighbors
+                (format out "~%--- NEIGHBORS (one hop out) ---~%")
+                (dolist (neighbor neighbors)
+                  (format out "~S~%~A" neighbor (symbol-summary neighbor)))))))
+        (format out "~%--- REPL ---~%~A" (repl-history (if full 3 1))))
       ;; conditions: one line each under :lean, the whole messy text under :full
       (when *conditions*
         (let ((n-cond (if full *max-conditions* (min 2 *max-conditions*))))
