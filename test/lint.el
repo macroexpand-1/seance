@@ -27,6 +27,12 @@
 ;; house style is one space after a period, in docstrings as everywhere else
 (setq sentence-end-double-space nil)
 
+;; The voice check matches verbs anywhere in the first line, so "text goes
+;; into TARGET" or "buffer evals" fail it although the docstring opens in the
+;; imperative. Emacs 31 turned it off by default as experimental; turning it
+;; off here makes every Emacs lint the same.
+(setq checkdoc-verb-check-experimental-flag nil)
+
 (dolist (file seance-lint-files)
   (checkdoc-file file))
 
