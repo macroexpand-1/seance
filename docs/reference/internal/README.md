@@ -12,4 +12,4 @@ Other material written here about how the system works (guides, explainers, walk
 
 | File | Shows |
 |---|---|
-| | |
+| [`usage.md`](usage.md) | Chat keys and commands, gptel setup, condition capture, configuration, tests and CI, implementation notes |
