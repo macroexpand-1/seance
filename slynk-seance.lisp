@@ -1,10 +1,11 @@
 ;;;; slynk-seance.lisp
 ;;;;
-;;;; The image side of seance. Exposes one RPC, SLYNK-SEANCE:IMAGE-CONTEXT,
-;;;; which returns a token-efficient snapshot of the live image for prepending
-;;;; to an LLM prompt.
+;;;; The image side of seance. Its main RPC, SLYNK-SEANCE:IMAGE-CONTEXT,
+;;;; returns a token-efficient snapshot of the live image for prepending to an
+;;;; LLM prompt; AUTOMATIC-CONDITIONS and WITH-CAPTURED-CONDITIONS feed the
+;;;; snapshot's condition ring.
 ;;;;
-;;;; I split it in two: a CL side and an ELisp side. EmacsLisp already has the data
+;;;; I split it in two: a CL side and an Emacs Lisp side. Emacs already has the data
 ;;;; and can capture it with stable advice. slynk-seance.lisp controls
 ;;;; what is inside the image: call-graph neighborhood, live REPL stuff, and noted conditions.
 ;;;;
@@ -99,14 +100,41 @@ defuns crowds everything else out of the snapshot.")
    \":foo\", \"foo\", \"#:foo\" and \"FOO\" all have to mean FOO. FIND-PACKAGE
    only understands the last one. SLYNK::GUESS-PACKAGE is what slynk uses to
    read the package of every request, so this reads ours the same way."
-  (or (typecase designator
-        (string  (slynk::guess-package designator))
-        (package designator)
-        (symbol  (and designator (find-package designator))))
-      *package*))
+  (etypecase designator
+    (null    *package*)
+    (package designator)
+    (string  (or (slynk::guess-package designator) *package*))
+    (symbol  (or (find-package designator) *package*))))
+
+(defun read-in (name package)
+  "NAME read with *PACKAGE* bound to PACKAGE and #. switched off."
+  (let ((*package* package)
+        (*read-eval* nil))
+    (read-from-string name)))
+
+(defun find-accessible (symbol-name package)
+  "The symbol named SYMBOL-NAME in PACKAGE and :FOUND, or NIL and :NONE."
+  (multiple-value-bind (symbol status) (find-symbol symbol-name package)
+    (if status
+        (values symbol :found)
+        (values nil :none))))
+
+(defun classify-read (object scratch home)
+  "What OBJECT, read in SCRATCH, names in HOME: the symbol and :FOUND, or NIL
+and :NONE."
+  (cond ((not (symbolp object))
+         (values nil :none))
+        ;; unqualified, so the reader parked it in SCRATCH; ask the real
+        ;; package whether it has one by that name.
+        ((eq (symbol-package object) scratch)
+         (find-accessible (symbol-name object) home))
+        (t
+         (values object :found))))
 
 (defun resolve-symbol (name package-designator)
-  "Reads NAME as a symbol in PACKAGE-DESIGNATOR but no eval. NIL on failure.
+  "Reads NAME as a symbol in PACKAGE-DESIGNATOR but no eval. Two values: the
+   symbol and :FOUND, or NIL and :NONE. Test the second, since \"nil\" names a
+   symbol too.
    Handles case and package qualifiers via reader, so FOO/foo/pkg:foo all behave
    the same as they do in the REPL.
 
@@ -121,17 +149,8 @@ defuns crowds everything else out of the snapshot.")
   (let ((home    (resolve-package package-designator))
         (scratch (make-package (gensym "SEANCE-READ-") :use '())))
     (unwind-protect
-         (handler-case
-             (let ((obj (let ((*package* scratch)
-                              (*read-eval* nil))
-                          (read-from-string name))))
-               (cond ((not (symbolp obj)) nil)
-                     ;; unqualified, so the reader parked it in SCRATCH; ask
-                     ;; the real package whether it has one by that name.
-                     ((eq (symbol-package obj) scratch)
-                      (find-symbol (symbol-name obj) home))
-                     (t obj)))
-           (error () nil))
+         (handler-case (classify-read (read-in name scratch) scratch home)
+           (error () (values nil :none)))
       (delete-package scratch))))
 
 (defun first-line (string)
@@ -153,6 +172,14 @@ defuns crowds everything else out of the snapshot.")
      (prin1-to-string object))
    limit))
 
+(defun unwrap-name-block (form name)
+  "FORM's body forms when FORM is (BLOCK NAME ...), otherwise a list of FORM."
+  (if (and (consp form)
+           (eq (first form) 'block)
+           (eq (second form) name))
+      (copy-list (cddr form))
+      (list form)))
+
 (defun strip-name-block (lambda-expression name)
   "LAMBDA-EXPRESSION without the (BLOCK NAME ...) that DEFUN wraps its body in.
 The block is implied by DEFUN, so printing it only spends characters and adds a
@@ -162,14 +189,9 @@ level of nesting a reader has to see through. Anything that is not a plain
            (eq (first lambda-expression) 'lambda)
            (consp (rest lambda-expression)))
       (destructuring-bind (lambda-word args &rest body) lambda-expression
-        `(,lambda-word ,args
-          ,@(mapcan (lambda (form)
-                      (if (and (consp form)
-                               (eq (first form) 'block)
-                               (eq (second form) name))
-                          (copy-list (cddr form))
-                          (list form)))
-                    body)))
+        (list* lambda-word
+               args
+               (mapcan (lambda (form) (unwrap-name-block form name)) body)))
       lambda-expression))
 
 (defun truncate-definition (lambda-expression)
@@ -212,6 +234,18 @@ flattening any string literals inside the definition."
 (defun function-name (function)
   (nth-value 2 (function-lambda-expression function)))
 
+(defun introspected-callees (symbol)
+  "What SYMBOL calls, deduped, as SB-INTROSPECT sees it. Empty off SBCL."
+  #+sbcl
+  (if (fboundp symbol)
+      (remove-duplicates
+       (remove nil (mapcar #'function-name
+                           (sb-introspect:find-function-callees (fdefinition symbol))))
+       :test #'equal)
+      '())
+  #-sbcl
+  (progn symbol '()))
+
 (defun callees (symbol)
   "What SYMBOL calls. Empty when nobody can tell us.
    SLYNK-BACKEND:CALLS-WHO just says :NOT-IMPLEMENTED on SBCL, which is the
@@ -220,14 +254,7 @@ flattening any string literals inside the definition."
    the one-hop expansion below never fires."
   (handler-case
       (or (xref-names (slynk-backend:calls-who symbol))
-          #+sbcl
-          (when (fboundp symbol)
-            (remove-duplicates
-             (remove nil
-                     (mapcar #'function-name
-                             (sb-introspect:find-function-callees
-                              (fdefinition symbol))))
-             :test #'equal)))
+          (introspected-callees symbol))
     (error () '())))
 
 (defun implementation-symbol-p (symbol)
@@ -254,24 +281,28 @@ SBCL the implementation's packages are exactly the locked ones."
 PRIN1 under the caller's *PACKAGE*, so a prefix appears only when it is needed."
   (or (mapcar #'prin1-to-string names) '("<none>")))
 
+(defun write-arglist (out symbol)
+  "Write SYMBOL's arglist line to OUT, when the backend knows one."
+  (let ((arglist (ignore-errors (slynk-backend:arglist symbol))))
+    (when (and arglist (not (eq arglist :not-available)))
+      (format out " arglist: ~(~A~)~%" arglist))))
+
+(defun write-definition (out symbol)
+  "Write SYMBOL's printed definition to OUT, or its arglist when there is none."
+  ;; SBCL keeps this for interactive-defined fns. NIL otherwise
+  (let ((lex (ignore-errors (function-lambda-expression (fdefinition symbol)))))
+    (if lex
+        (format out " ~A~%" (truncate-definition (strip-name-block lex symbol)))
+        (write-arglist out symbol))))
+
 (defun symbol-summary (symbol)
   "Definition (or arglist, when there is no definition) and the first doc line,
 one indented line each. The name itself is the caller's to print."
   (with-output-to-string (s)
     (when (fboundp symbol)
-      (let ((lex (ignore-errors
-                  (nth-value 0
-                             (function-lambda-expression
-                              (fdefinition symbol))))))
-        (cond
-          ;; SBCL keeps this for interactive-defined fns. NIL otherwise
-          (lex (format s " ~A~%" (truncate-definition
-                                  (strip-name-block lex symbol))))
-          (t (let ((arglist (ignore-errors (slynk-backend:arglist symbol))))
-               (when (and arglist (not (eq arglist :not-available)))
-                 (format s " arglist: ~(~A~)~%" arglist)))))
-        (let ((doc (documentation symbol 'function)))
-          (when doc (format s " doc: ~A~%" (first-line doc))))))))
+      (write-definition s symbol)
+      (let ((doc (documentation symbol 'function)))
+        (when doc (format s " doc: ~A~%" (first-line doc)))))))
 
 ;;; The REPL. A request from Emacs runs inside the default listener's bindings,
 ;;; so +, ++, +++ (the last forms the mREPL read) and *, **, *** (the last
@@ -321,12 +352,78 @@ call, and that function calls IN-FUNCTION."
 (defun automatic-conditions (on)
   "Note conditions from every request Emacs makes when ON, or stop when not.
 Installs CAPTURE-REQUEST-CONDITIONS innermost, so its handler runs before any
-slynk establishes around the request. Returns whether capture is now on."
+slynk establishes around the request. Returns :ON or :OFF, whichever capture
+now is."
   (setf slynk:*eval-for-emacs-wrappers*
         (remove 'capture-request-conditions slynk:*eval-for-emacs-wrappers*))
   (when on
     (push 'capture-request-conditions slynk:*eval-for-emacs-wrappers*))
-  (and on t))
+  (if on :on :off))
+
+;;; Profiles. Everything :LEAN and :FULL do differently, in one place.
+
+(defstruct limits
+  "What a profile lets into the snapshot."
+  (callers 0 :read-only t)
+  (conditions 0 :read-only t)
+  (repl-depth 1 :read-only t)
+  (neighbors-p nil :read-only t)
+  (whole-conditions-p nil :read-only t))
+
+(defun profile-limits (profile)
+  "The LIMITS for PROFILE, :LEAN or :FULL. Any other profile is an error, not
+a quiet :LEAN."
+  (ecase profile
+    (:lean (make-limits :callers (min 6 *max-callers*)
+                        :conditions (min 2 *max-conditions*)
+                        :repl-depth 1
+                        :neighbors-p nil
+                        :whole-conditions-p nil))
+    (:full (make-limits :callers *max-callers*
+                        :conditions *max-conditions*
+                        :repl-depth 3
+                        :neighbors-p t
+                        :whole-conditions-p t))))
+
+;;; Sections. Each writes one "--- TITLE ---" section to OUT; Emacs trims the
+;;; snapshot a section at a time by those headings.
+
+(defun write-neighbors (out focus callees)
+  "Write a summary of each callee of FOCUS one hop out, when there are any.
+Its own section, so a snapshot over Emacs's size limit can give it up first."
+  (let ((neighbors (subseq-safe (expandable-neighbors focus callees) *max-neighbors*)))
+    (when neighbors
+      (format out "~%--- NEIGHBORS (one hop out) ---~%")
+      (dolist (neighbor neighbors)
+        (format out "~S~%~A" neighbor (symbol-summary neighbor))))))
+
+(defun write-focus (out focus limits)
+  "Write FOCUS's definition and call graph, and its neighbors when LIMITS says."
+  (let ((callers (callers focus))
+        (callees (callees focus)))
+    (format out "~%--- FOCUS: ~S ---~%~A" focus (symbol-summary focus))
+    (format out " called-by: ~{~A~^, ~}~%"
+            (printed-names (subseq-safe callers (limits-callers limits))))
+    (format out " calls: ~{~A~^, ~}~%"
+            (printed-names (subseq-safe callees (limits-callers limits))))
+    (when (limits-neighbors-p limits)
+      (write-neighbors out focus callees))))
+
+(defun write-conditions (out limits)
+  "Write the recent conditions, one line each unless LIMITS wants them whole."
+  (when *conditions*
+    (format out "~%--- RECENT CONDITIONS ---~%")
+    (dolist (text (subseq-safe *conditions* (limits-conditions limits)))
+      (format out " ~A~%" (if (limits-whole-conditions-p limits)
+                              text
+                              (first-line text))))))
+
+(defun focus-symbol (focus-name package)
+  "FOCUS-NAME resolved in PACKAGE: the symbol and :FOUND, or NIL and :NONE,
+which is also the answer when there is no FOCUS-NAME at all."
+  (if focus-name
+      (resolve-symbol focus-name package)
+      (values nil :none)))
 
 ;;; RPC
 
@@ -341,37 +438,17 @@ staples its own eval-log section onto whatever this hands back.
 
 Everything prints with *PACKAGE* bound to the focus package, so names from that
 package come out bare and names from anywhere else keep their prefix."
-  (let* ((full    (eq profile :full))
-         (n-call  (if full *max-callers* (min 6 *max-callers*)))
-         (package (resolve-package package-name))
+  (let* ((limits    (profile-limits profile))
+         (package   (resolve-package package-name))
          (*package* package))
     (with-output-to-string (out)
       (format out "=== LISP IMAGE CONTEXT (~(~A~)) ===~%" profile)
       (format out "Package: ~A~%" (package-name package))
-      (let ((focus (and focus-name (resolve-symbol focus-name package))))
-        (when focus
-          (let ((callers (callers focus))
-                (callees (callees focus)))
-            (format out "~%--- FOCUS: ~S ---~%~A" focus (symbol-summary focus))
-            (format out " called-by: ~{~A~^, ~}~%"
-                    (printed-names (subseq-safe callers n-call)))
-            (format out " calls: ~{~A~^, ~}~%"
-                    (printed-names (subseq-safe callees n-call)))
-            ;; one hop neighborhood, only under :full. Its own section, so a
-            ;; snapshot over Emacs's size limit can give it up first.
-            (let ((neighbors (and full
-                                  (subseq-safe (expandable-neighbors focus callees)
-                                               *max-neighbors*))))
-              (when neighbors
-                (format out "~%--- NEIGHBORS (one hop out) ---~%")
-                (dolist (neighbor neighbors)
-                  (format out "~S~%~A" neighbor (symbol-summary neighbor)))))))
-        (format out "~%--- REPL ---~%~A" (repl-history (if full 3 1))))
-      ;; conditions: one line each under :lean, the whole messy text under :full
-      (when *conditions*
-        (let ((n-cond (if full *max-conditions* (min 2 *max-conditions*))))
-          (format out "~%--- RECENT CONDITIONS ---~%")
-          (dolist (c (subseq-safe *conditions* n-cond))
-            (format out " ~A~%" (if full c (first-line c)))))))))
+      (multiple-value-bind (focus status) (focus-symbol focus-name package)
+        (ecase status
+          (:found (write-focus out focus limits))
+          (:none  nil)))
+      (format out "~%--- REPL ---~%~A" (repl-history (limits-repl-depth limits)))
+      (write-conditions out limits))))
 
 (provide :slynk-seance)

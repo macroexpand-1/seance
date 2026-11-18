@@ -13,9 +13,11 @@ The top-level `README.md` covers what seance is and how to install it; this page
 | gptel's send key | gptel | Sends the message, with a fresh snapshot every time. |
 | `C-c C-r` | Claude | Folds a fresh snapshot into the next message, for the chat it is pressed in. |
 | `C-c C-k` | Claude | Stops a streaming answer, or gives up on a snapshot fetch that never returned. |
-| `M-x seance-cancel-fetch` | gptel | Gives up on a snapshot fetch that never returned. |
+| `M-x seance-claude-interrupt` | Claude | The same, from outside the chat: it finds the chat that is busy, and asks which when several are. |
+| `C-c C-k` | gptel | Gives up on a snapshot fetch that never returned (gptel stops its own answers). |
 | `C-c C-e` | Both | Evaluates every form in the code block at point. |
 | `C-u M-x seance-claude` | Claude | Opens a second, independent chat in its own buffer. |
+| `C-u M-x seance-gptel` | gptel | Opens a second, independent chat in its own buffer. |
 | `M-x seance-preview-context` | Either | Shows exactly what would be sent, without sending it. |
 | `M-x seance-clear-log` | Either | Clears the eval log. |
 
@@ -36,6 +38,7 @@ The eval is logged like any other, so the next turn sees what the suggestion act
 
 Landed in the debugger?
 Just ask.
+The README's setup puts the chat keys in `sly-db-mode-map` too, so the key that asks from source also asks from SLDB.
 While an SLDB buffer is open, the snapshot carries its condition, its restarts and the top frames (`seance-debugger-frames` sets how many).
 Once SLDB closes, that section drops out of the snapshot again.
 
@@ -103,7 +106,7 @@ The ones most worth knowing:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `seance-profile` | `:lean` | `:lean` trims the snapshot for small local models, which have small windows and big opinions; `:full` adds the one-hop callers and callees. |
+| `seance-profile` | `:lean` | `:lean` trims the snapshot for small local models, which have small windows and big opinions; `:full` adds a summary of each callee one hop out, and lists more callers, REPL history and condition text. |
 | `seance-claude-profile` | `:full` | Overrides `seance-profile` for the Claude transport, because Claude can take it. |
 | `seance-claude-extra-args` | `nil` | Extra CLI arguments, such as `'("--disallowed-tools" "Edit" "Write" "Bash")` if you want it answering questions rather than rearranging your repo. |
 | `seance-claude-lean` | `t` | Runs the CLI in a neutral directory, so it doesn't drag your whole project's `CLAUDE.md` and hooks along for the ride. |

@@ -1,7 +1,7 @@
 ;;; seance-gptel.el --- seance transport: gptel  -*- lexical-binding: t; -*-
 
 ;; Author: Real Limoges <b.real.limoges@gmail.com>
-;; URL: https://github.com/real-limoges/seance
+;; URL: https://github.com/macroexpand-1/seance
 ;; Version: 0.1.0
 ;; Keywords: lisp, tools, convenience
 ;; SPDX-License-Identifier: BSD-2-Clause
@@ -38,17 +38,18 @@
 (defvar gptel-backend)
 (defvar gptel-model)
 (defvar gptel-stream)
+(defvar gptel-default-mode)
 
 (defgroup seance-gptel nil
   "Push live Lisp image context to a local LLM via gptel."
   :group 'seance)
 
 (defcustom seance-gptel-backend nil
-  "GPTEL backend object. See `seance-gptel-use-openai-compatible'."
+  "The gptel backend object. See `seance-gptel-use-openai-compatible'."
   :type 'sexp)
 
 (defcustom seance-gptel-model nil
-  "GPTEL model symbol."
+  "The gptel model, as a symbol."
   :type 'symbol)
 
 ;; The backend object above cannot go in your init: it is a struct that only
@@ -86,7 +87,7 @@ local models this thing usually points at."
           "current state of the image; trust it over any earlier code in the "
           "conversation. Answer concisely with forms ready to evaluate. "
           "No file scaffolding, no preamble.")
-  "This is the system preamble.
+  "System prompt for every send; the snapshot is appended after it.
 Small models follow tight instructions better than vibes."
   :type 'string)
 
@@ -101,7 +102,7 @@ Small models follow tight instructions better than vibes."
 (defun seance-gptel--require-openai ()
   "Like `seance-gptel--require', and make sure `gptel-make-openai' is callable.
 That constructor lives in gptel-openai.el, which a package install autoloads
-and a bare `load-path` does not. Asking for it by name beats dying of
+and a bare `load-path' does not. Asking for it by name beats dying of
 void-function halfway through configuring a backend."
   (seance-gptel--require)
   (unless (fboundp 'gptel-make-openai)
@@ -192,28 +193,42 @@ fires once it lands. `seance-cancel-fetch' gives up on one that never does."
   (let ((m (make-sparse-keymap)))
     (define-key m [remap gptel-send] #'seance-gptel-send)
     (define-key m (kbd "C-c C-e") #'seance-eval-block)
+    (define-key m (kbd "C-c C-k") #'seance-cancel-fetch)
     m)
   "Keymap for `seance-gptel-chat-mode'.
 Remaps `gptel-send' to `seance-gptel-send' so every send grabs a fresh
-snapshot first, and puts `seance-eval-block' on
-\\<seance-gptel-chat-mode-map>\\[seance-eval-block].")
+snapshot first, puts `seance-eval-block' on
+\\<seance-gptel-chat-mode-map>\\[seance-eval-block], and gives up on a snapshot
+that never came back with \\[seance-cancel-fetch], the key the Claude chat
+uses for the same thing.")
 
 (define-minor-mode seance-gptel-chat-mode
   "Re-snapshot the live Lisp image before every gptel send."
   :lighter " Seance" :keymap seance-gptel-chat-mode-map)
 
 ;;;###autoload
-(defun seance-gptel ()
+(defun seance-gptel (&optional new)
   "Open or switch to the chat buffer wired into the gptel backend.
 Ask a question, send it with your usual gptel key. The snapshot gets refreshed
-into the system message on the way out."
-  (interactive)
+into the system message on the way out.
+
+With a prefix argument, NEW opens a separate chat in its own buffer, so two
+lines of inquiry can stay open at once. Run from inside a chat buffer it stays
+in that buffer, not whichever one happens to hold the default name."
+  (interactive "P")
   (seance-gptel--require)
   (let ((backend (seance-gptel--ensure-backend))
-        (buf     (get-buffer-create seance-gptel-buffer-name)))
+        (buf     (get-buffer-create
+                  (cond (new (generate-new-buffer-name seance-gptel-buffer-name))
+                        ((equal seance--chat-transport "gptel") (buffer-name))
+                        (t seance-gptel-buffer-name)))))
     (unless backend
       (message "seance-gptel: no backend yet; M-x seance-gptel-use-openai-compatible"))
     (with-current-buffer buf
+      ;; gptel-mode refuses any major mode it cannot write a chat in, and a
+      ;; fresh buffer is fundamental-mode, so pick the one gptel's own chats use
+      (unless (derived-mode-p 'org-mode 'markdown-mode 'text-mode)
+        (funcall gptel-default-mode))
       (unless (bound-and-true-p gptel-mode) (gptel-mode 1))
       (when backend            (setq-local gptel-backend backend))
       (when seance-gptel-model (setq-local gptel-model seance-gptel-model))
