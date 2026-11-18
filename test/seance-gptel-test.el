@@ -118,6 +118,32 @@
     (should (fboundp cmd))
     (should (commandp cmd))))
 
+;;; The chat buffer, at parity with the Claude one
+
+(ert-deftest seance-gptel-chat-gives-up-on-a-fetch-with-the-claude-key ()
+  (should (eq #'seance-cancel-fetch
+              (lookup-key seance-gptel-chat-mode-map (kbd "C-c C-k")))))
+
+(ert-deftest seance-gptel-prefix-opens-a-separate-chat ()
+  (skip-unless (featurep 'gptel))
+  (let ((seance-gptel-backend nil)
+        (seance-gptel-host nil)
+        (seance-gptel-model-name nil)
+        (seance-gptel-buffer-name " *seance-test-gptel*")
+        (made nil))
+    (unwind-protect
+        (save-window-excursion
+          (seance-gptel)
+          (push (current-buffer) made)
+          ;; again from inside the chat: the same chat
+          (seance-gptel)
+          (should (eq (car made) (current-buffer)))
+          ;; with a prefix: a new one
+          (seance-gptel t)
+          (push (current-buffer) made)
+          (should-not (eq (car made) (cadr made))))
+      (mapc #'kill-buffer made))))
+
 ;;; Profile: this backend inherits, because it usually points at small models
 
 (ert-deftest seance-gptel-profile-inherits-by-default ()

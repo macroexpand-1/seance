@@ -134,6 +134,13 @@
        (null (call-sq "RESOLVE-SYMBOL" "no-such-symbol-please" :seance-fixture)))
   (chk "resolve-symbol interned nothing while failing"
        (null (nth-value 1 (find-symbol "NO-SUCH-SYMBOL-PLEASE" :seance-fixture))))
+  (chk "resolve-symbol says :found alongside a hit"
+       (eq :found (nth-value 1 (call-sq "RESOLVE-SYMBOL" "focus" :seance-fixture))))
+  (chk "resolve-symbol says :none on garbage"
+       (eq :none (nth-value 1 (call-sq "RESOLVE-SYMBOL" "#<not a symbol" :cl-user))))
+  ;; the reason for the status: NIL is a symbol a name can resolve to
+  (chk "resolve-symbol tells the symbol NIL from no symbol"
+       (eq :found (nth-value 1 (call-sq "RESOLVE-SYMBOL" "nil" :cl-user))))
   (chk "resolve-symbol leaves no scratch packages behind"
        (notany (lambda (p) (search "SEANCE-READ-" (package-name p)))
                (list-all-packages)))
@@ -161,7 +168,7 @@
          (cap     (symbol-value (sq *max-definition-chars*))))
     ;; if SBCL ever stops retaining this, the cap goes untested rather than
     ;; silently broken, so assert the precondition before the behavior.
-    (chk "SBCL retained the lambda expression (else this proves nothing)" lex)
+    (chk "SBCL retained the lambda expression (otherwise this proves nothing)" lex)
     (chk "uncapped the definition would have been enormous"
          (> (length (prin1-to-string lex)) (* 4 cap)))
     (chk "summary stays within a doc line or two of the cap"
@@ -256,7 +263,11 @@
     (chk "unknown symbol does not signal"       (contains "=== LISP IMAGE CONTEXT" bad))
     (chk "unknown package does not signal"      (contains "=== LISP IMAGE CONTEXT" bad-pkg)))
   (chk "profile defaults to :lean"
-       (contains "(lean)" (image-context "focus" "SEANCE-FIXTURE"))))
+       (contains "(lean)" (image-context "focus" "SEANCE-FIXTURE")))
+  ;; a misspelled profile used to mean :lean without a word
+  (chk "an unknown profile is refused, not read as :lean"
+       (handler-case (progn (image-context "focus" "SEANCE-FIXTURE" :ful) nil)
+         (error () t))))
 
 (section "image-context: the package arrives spelled as IN-PACKAGE spells it"
   ;; SLY sends the package string straight out of the buffer's IN-PACKAGE
@@ -310,7 +321,7 @@
 (section "automatic conditions through *eval-for-emacs-wrappers*"
   (let ((slynk:*eval-for-emacs-wrappers* '()))
     (setf (symbol-value (sq *conditions*)) '())
-    (chk "turning it on reports on"   (eq t (call-sq "AUTOMATIC-CONDITIONS" t)))
+    (chk "turning it on reports on"   (eq :on (call-sq "AUTOMATIC-CONDITIONS" t)))
     (call-sq "AUTOMATIC-CONDITIONS" t)
     (chk "turning it on twice installs one wrapper"
          (= 1 (length slynk:*eval-for-emacs-wrappers*)))
@@ -324,7 +335,7 @@
       (chk "the condition still reaches slynk's handlers" reached)
       (chk "and it landed in the ring"
            (contains "escaped the request" (first (symbol-value (sq *conditions*))))))
-    (chk "turning it off reports off" (null (call-sq "AUTOMATIC-CONDITIONS" nil)))
+    (chk "turning it off reports off" (eq :off (call-sq "AUTOMATIC-CONDITIONS" nil)))
     (chk "turning it off removes the wrapper" (null slynk:*eval-for-emacs-wrappers*))))
 
 ;;; report

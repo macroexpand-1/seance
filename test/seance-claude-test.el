@@ -132,6 +132,30 @@
   (with-temp-buffer
     (should-error (seance-claude-interrupt) :type 'user-error)))
 
+(ert-deftest seance-claude-interrupt-finds-the-busy-chat-from-elsewhere ()
+  ;; bound in a Lisp buffer, the key used to look only at that buffer's own
+  ;; state and always report nothing in flight
+  (let ((chat (generate-new-buffer " *seance-test-chat*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat
+            (setq seance-claude--session "abc"
+                  seance--fetch (list 'fetch)))
+          (with-temp-buffer
+            (seance-claude-interrupt))
+          (should-not (buffer-local-value 'seance--fetch chat)))
+      (kill-buffer chat))))
+
+(ert-deftest seance-claude-interrupt-target-skips-idle-chats ()
+  (let ((idle (generate-new-buffer " *seance-test-idle*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer idle
+            (setq seance-claude--session "abc"))
+          (with-temp-buffer
+            (should-error (seance-claude-interrupt) :type 'user-error)))
+      (kill-buffer idle))))
+
 ;;; The stream parser, end to end against test/fake-claude
 
 (defconst seance-claude-test--fake

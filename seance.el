@@ -1,7 +1,7 @@
 ;;; seance.el --- Hand an LLM a snapshot of your live Lisp image  -*- lexical-binding: t; -*-
 
 ;; Author: Real Limoges <b.real.limoges@gmail.com>
-;; URL: https://github.com/real-limoges/seance
+;; URL: https://github.com/macroexpand-1/seance
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "28.1") (sly "1.0.43"))
 ;; Keywords: lisp, tools, convenience
@@ -52,8 +52,9 @@
 That's a question about the model's context budget, not about how the bytes
 travel, so a backend can override it: see `seance-claude-profile'.
 
-`:lean' drops the one-hop callee expansion and the REPL values, and trims the
-caller and condition lists. Small local windows need room to breathe."
+`:lean' drops the one-hop callee expansion, keeps only the last REPL form and
+value, and trims the caller and condition lists. Small local windows need room
+to breathe."
   :type '(choice (const :lean) (const :full)))
 
 (defcustom seance-log-size 12
@@ -288,7 +289,7 @@ or take `seance' out of `sly-contribs'."
 ;;; ASSEMBLE
 
 (defun seance--profile (&optional override)
-  "Profile to ask the image for: OVERRIDE if non-nil, else `seance-profile'.
+  "Profile to ask the image for: OVERRIDE if non-nil, otherwise `seance-profile'.
 Each transport keeps its own profile custom that may be nil meaning \"inherit\",
 see `seance-claude-profile' and `seance-gptel-profile', so they resolve it
 through here rather than each spelling out the same `or'."
@@ -407,6 +408,11 @@ the end goes, as a last resort, with a note saying where."
 ;;; condition, the ways out, and where it happened. SLY already has all of it
 ;;; in the SLDB buffer, so it is read from there rather than asked for again.
 
+(defconst seance--debugger-restarts 6
+  "How many of an open debugger's restarts to put in the snapshot.
+The first few are the ones worth choosing between; past that they are mostly
+the same abort repeated at every outer level.")
+
 (defun seance--debugger-buffer ()
   "The SLDB buffer to describe, or nil when there is none.
 This one, when called from one; otherwise the deepest level still open."
@@ -440,7 +446,7 @@ This one, when called from one; otherwise the deepest level still open."
          " restarts:\n"
          (mapconcat (lambda (line) (concat "  " line "\n"))
                     (cl-loop for (name description) in sly-db-restarts
-                             for i from 0 below 6
+                             for i from 0 below seance--debugger-restarts
                              collect (format "%d: [%s] %s" i name description))
                     "")
          " backtrace:\n"
@@ -524,7 +530,7 @@ overrides `seance-profile' for this call."
   (and seance--fetch t))
 
 (defun seance-fetch-context (k &optional profile)
-  "Fetch a snapshot for this buffer and call K with it, unless cancelled first.
+  "Fetch a snapshot for this buffer and call K with it, unless canceled first.
 Refuses while an earlier fetch here is still waiting: that one would turn into
 a second send the moment the image answered. PROFILE is as for
 `seance-context-string-async'."

@@ -1,7 +1,7 @@
 ;;; seance-claude.el --- seance transport: the claude CLI  -*- lexical-binding: t; -*-
 
 ;; Author: Real Limoges <b.real.limoges@gmail.com>
-;; URL: https://github.com/real-limoges/seance
+;; URL: https://github.com/macroexpand-1/seance
 ;; Version: 0.1.0
 ;; Keywords: lisp, tools, convenience
 ;; SPDX-License-Identifier: BSD-2-Clause
@@ -41,7 +41,7 @@ can't find it on PATH."
   :type 'string)
 
 (defcustom seance-claude-model nil
-  "Model passed to `claude --model'.  nil uses the CLI's default."
+  "Model passed to `claude --model'. nil uses the CLI's default."
   :type '(choice (const :tag "CLI default" nil) string))
 
 (defcustom seance-claude-extra-args nil
@@ -363,16 +363,41 @@ id for the next try, which is correct whether or not the old one was claimed."
            (seance--profile seance-claude-profile))
         (funcall go msg)))))
 
+(defun seance-claude--busy-p (buffer)
+  "Non-nil when BUFFER is a chat with a snapshot fetch or an answer in flight."
+  (with-current-buffer buffer
+    (and seance-claude--session
+         (or (seance-fetching-p) (process-live-p seance-claude--proc)))))
+
+(defun seance-claude--interrupt-target ()
+  "The chat buffer an interrupt should act on.
+This one, when it is a chat; otherwise the one chat with something in flight,
+asking which when there are several. Refuses when there is none."
+  (if seance-claude--session
+      (current-buffer)
+    (let ((busy (seq-filter #'seance-claude--busy-p (buffer-list))))
+      (cond ((null busy)
+             (user-error "Seance-claude: nothing in flight"))
+            ((null (cdr busy))
+             (car busy))
+            (t
+             (get-buffer (completing-read "Stop which chat: "
+                                          (mapcar #'buffer-name busy) nil t)))))))
+
 ;;;###autoload
 (defun seance-claude-interrupt ()
-  "Stop whatever this chat is in the middle of: the snapshot fetch, or the answer."
+  "Stop whatever a chat is in the middle of: the snapshot fetch, or the answer.
+In a chat buffer it acts on that chat. From anywhere else (the Lisp buffer you
+asked from, say) it finds the chat that is busy, so one key stops it from
+either side."
   (interactive)
-  (cond ((seance-fetching-p)
-         (seance-cancel-fetch))
-        ((process-live-p seance-claude--proc)
-         (seance-claude--stop seance-claude--proc)
-         (message "seance-claude: stopped"))
-        (t (user-error "Seance-claude: nothing in flight"))))
+  (with-current-buffer (seance-claude--interrupt-target)
+    (cond ((seance-fetching-p)
+           (seance-cancel-fetch))
+          ((process-live-p seance-claude--proc)
+           (seance-claude--stop seance-claude--proc)
+           (message "seance-claude: stopped"))
+          (t (user-error "Seance-claude: nothing in flight")))))
 
 (defun seance-claude--stop-on-kill ()
   "Stop this chat's answer when the chat buffer goes away.
@@ -403,7 +428,7 @@ happens to hold the default name."
       (if existing
           (progn
             (setq seance-claude--refresh t)
-            (message "Seance-claude: a fresh image snapshot will ride along with your next send"))
+            (message "seance-claude: a fresh image snapshot will ride along with your next send"))
         (when (fboundp 'markdown-mode) (markdown-mode))
         (seance-claude-chat-mode 1)
         (setq seance--chat-transport "claude"
@@ -412,9 +437,9 @@ happens to hold the default name."
               seance-claude--refresh nil)
         (add-hook 'kill-buffer-hook #'seance-claude--stop-on-kill nil t)
         (insert "# seance-claude chat\n\n"
-                "Type below, then `C-c C-c' to send. `C-c C-r' refreshes the "
-                "image snapshot, `C-c C-k' stops an answer in progress, "
-                "`C-c C-e' evaluates the code block at point. "
+                "Type below, then `C-c C-c` to send. `C-c C-r` refreshes the "
+                "image snapshot, `C-c C-k` stops an answer in progress, "
+                "`C-c C-e` evaluates the code block at point. "
                 "Runs on your Claude Code subscription.\n\n"
                 "## You\n\n")
         (setq seance-claude--input-start (point-marker))))
